@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file expert_format.h
-/// @brief NXP expert file format definitions.
+/// @brief NXP expert file format definitions and writer/reader classes.
 ///
 /// The .nxp format stores packed ternary expert weights with 64-byte
 /// cache-line alignment and CRC32C integrity checksums. Layout:
@@ -9,6 +9,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace nos {
 
@@ -62,5 +64,66 @@ struct NxpExpertEntry {
 
 static_assert(sizeof(NxpExpertEntry) == 64,
               "NxpExpertEntry must be exactly 64 bytes");
+
+// -- NXP Writer --
+
+/// Writes packed expert data to a .nxp file with 64-byte alignment and CRC32C.
+class NxpWriter {
+public:
+    NxpWriter();
+    ~NxpWriter();
+
+    NxpWriter(const NxpWriter&) = delete;
+    NxpWriter& operator=(const NxpWriter&) = delete;
+
+    bool open(const std::string& path, const NxpFileHeader& header);
+
+    NxpExpertEntry write_expert(uint32_t layer_id, uint32_t expert_id,
+                                const uint8_t* packed_weights, size_t weight_size,
+                                const uint16_t* scale_factors, uint32_t num_channels);
+
+    bool finalize();
+    bool is_open() const;
+
+private:
+    int fd_ = -1;
+    uint64_t write_offset_ = 0;
+    NxpFileHeader header_{};
+    std::vector<NxpExpertEntry> entries_;
+
+    void close();
+    void write_bytes(const uint8_t* data, size_t len);
+    bool write_at(uint64_t offset, const void* data, size_t len);
+    void pad_to_alignment();
+};
+
+// -- NXP Reader --
+
+/// Reads and verifies packed expert data from a .nxp file.
+class NxpReader {
+public:
+    NxpReader();
+    ~NxpReader();
+
+    NxpReader(const NxpReader&) = delete;
+    NxpReader& operator=(const NxpReader&) = delete;
+
+    bool open(const std::string& path);
+    const NxpFileHeader& header() const;
+    const NxpExpertEntry* find_expert(uint32_t layer_id, uint32_t expert_id) const;
+
+    int read_expert(const NxpExpertEntry& entry, uint8_t* buf, size_t buf_size,
+                    int retry_count = 3);
+    int read_scales(const NxpExpertEntry& entry, uint16_t* buf, size_t buf_size);
+
+    void close();
+    bool is_open() const;
+    size_t num_entries() const;
+
+private:
+    int fd_ = -1;
+    NxpFileHeader header_{};
+    std::vector<NxpExpertEntry> entries_;
+};
 
 }  // namespace nos

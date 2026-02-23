@@ -19,3 +19,101 @@ target_include_directories(test_smoke
 )
 
 catch_discover_tests(test_smoke)
+
+# ── Platform I/O Tests ──────────────────────────────────────────────────────
+add_executable(test_platform_io test_platform_io.cpp)
+
+target_link_libraries(test_platform_io
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_io
+)
+
+target_include_directories(test_platform_io
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/io
+)
+
+catch_discover_tests(test_platform_io)
+
+# ── Packing Tests ──────────────────────────────────────────────────────────
+add_executable(test_packing test_packing.cpp)
+
+target_link_libraries(test_packing
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_kernel
+)
+
+target_include_directories(test_packing
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/kernel
+)
+
+catch_discover_tests(test_packing)
+
+# ── BitNet Kernel Tests ────────────────────────────────────────────────────
+add_executable(test_bitnet_kernel test_bitnet_kernel.cpp)
+
+target_link_libraries(test_bitnet_kernel
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_kernel
+)
+
+target_include_directories(test_bitnet_kernel
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/kernel
+)
+
+catch_discover_tests(test_bitnet_kernel)
+
+# ── Packing Benchmark ─────────────────────────────────────────────────────
+add_executable(bench_packing bench_packing.cpp)
+
+target_link_libraries(bench_packing
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_kernel
+)
+
+target_include_directories(bench_packing
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/kernel
+)
+
+# Benchmarks are tagged with [.benchmark] so they don't run by default.
+# Run manually: ./build/tests/bench_packing --benchmark-no-analysis
+catch_discover_tests(bench_packing)
+
+# ── CRC32 Tests ─────────────────────────────────────────────────────────────
+add_executable(test_crc32 test_crc32.cpp)
+
+target_link_libraries(test_crc32
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_format
+)
+
+target_include_directories(test_crc32
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/format
+)
+
+catch_discover_tests(test_crc32)
+
+# ── Expert Format Tests ─────────────────────────────────────────────────────
+add_executable(test_expert_format test_expert_format.cpp)
+
+target_link_libraries(test_expert_format
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_format
+)
+
+target_include_directories(test_expert_format
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/format
+)
+
+catch_discover_tests(test_expert_format)
