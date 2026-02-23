@@ -117,3 +117,19 @@ target_include_directories(test_expert_format
 )
 
 catch_discover_tests(test_expert_format)
+
+# ── Tokenizer Tests ─────────────────────────────────────────────────────────
+add_executable(test_tokenizer test_tokenizer.cpp)
+
+target_link_libraries(test_tokenizer
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_tokenizer
+)
+
+target_include_directories(test_tokenizer
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/tokenizer
+)
+
+catch_discover_tests(test_tokenizer)
