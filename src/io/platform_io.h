@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <memory>
 #include <sys/types.h>
+#include <vector>
 
 namespace nos {
 
@@ -29,20 +30,23 @@ class PlatformIO {
 public:
     virtual ~PlatformIO() = default;
 
-    /// Submit a read request (non-blocking).
+    /// Submit a read request.
+    ///
+    /// For synchronous backends (PreadBackend), the read completes immediately
+    /// and the result is available on the next poll().
     ///
     /// @param fd        File descriptor to read from
     /// @param buf       Destination buffer
     /// @param len       Number of bytes to read
     /// @param offset    File offset to read from
     /// @param userdata  Caller context, returned in IoCompletion
-    /// @return Number of submissions queued, or negative errno
+    /// @return 0 on success, or negative errno on error
     virtual int submit_read(int fd, void* buf, size_t len, off_t offset, void* userdata) = 0;
 
     /// Poll for completed I/O operations.
     ///
-    /// Blocks up to timeout_ms milliseconds. Returns immediately if
-    /// completions are already available.
+    /// Blocks up to timeout_ms milliseconds.
+    /// -1 = block forever, 0 = non-blocking.
     ///
     /// @param completions  Output array for completed operations
     /// @param max_events   Maximum completions to return
@@ -50,11 +54,28 @@ public:
     /// @return Number of completions harvested, or negative errno
     virtual int poll(IoCompletion* completions, int max_events, int timeout_ms) = 0;
 
+    /// Number of in-flight (submitted but not yet polled) requests.
+    virtual int pending() const = 0;
+
     /// Factory: create the best available I/O backend for the current platform.
     ///
     /// On Linux: creates IoUringBackend if io_uring is available, else PreadBackend.
     /// On macOS: creates PreadBackend (kqueue cannot async-complete file reads).
     static std::unique_ptr<PlatformIO> create();
+};
+
+/// Synchronous pread fallback backend (available on all POSIX platforms).
+///
+/// submit_read() executes pread() immediately and buffers the completion.
+/// poll() drains the internal completion queue.
+class PreadBackend : public PlatformIO {
+public:
+    int submit_read(int fd, void* buf, size_t len, off_t offset, void* userdata) override;
+    int poll(IoCompletion* completions, int max_events, int timeout_ms) override;
+    int pending() const override;
+
+private:
+    std::vector<IoCompletion> completions_;
 };
 
 }  // namespace nos
