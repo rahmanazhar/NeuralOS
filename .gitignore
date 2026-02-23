@@ -1,0 +1,26 @@
+# Build directories
+build/
+build-debug/
+cmake-build-*/
+
+# Editor/IDE caches
+.cache/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Compiled objects
+*.o
+*.a
+*.so
+*.dylib
+
+# Generated files
+compile_commands.json
+
+# macOS
+.DS_Store
+
+# Dependency fetches (managed by FetchContent)
+_deps/
