@@ -17,6 +17,9 @@ include(cmake/SimdDetection.cmake)
 include(cmake/CompilerWarnings.cmake)
 include(cmake/FetchDependencies.cmake)
 
+# ── Testing ─────────────────────────────────────────────────────────────────
+enable_testing()
+
 # ── Subdirectories ──────────────────────────────────────────────────────────
 add_subdirectory(src)
 add_subdirectory(tests)

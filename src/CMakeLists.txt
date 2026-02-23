@@ -1,1 +1,5 @@
-# Subdirectories will be added by Plan 01-02 (Task 2)
+# ── NeuralOS Source Subdirectories ───────────────────────────────────────────
+add_subdirectory(kernel)
+add_subdirectory(io)
+add_subdirectory(format)
+add_subdirectory(tokenizer)
