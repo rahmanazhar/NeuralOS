@@ -44,4 +44,22 @@ void bitnet_init();
 void bitnet_matvec(const uint8_t* packed_weights, const float* input, float* output, int rows,
                    int cols, const uint16_t* scale_factors);
 
+/// Get the name of the currently selected backend.
+/// Returns "scalar", "avx512", or "neon". Must be called after bitnet_init().
+const char* bitnet_get_backend_name();
+
+// ── Backend declarations ────────────────────────────────────────────────────
+
+/// Scalar reference implementation (golden reference, always available).
+void bitnet_matvec_scalar(const uint8_t* packed_weights, const float* input, float* output,
+                          int rows, int cols, const uint16_t* scale_factors);
+
+/// AVX-512 implementation (x86-64 with AVX-512F + AVX-512BW).
+void bitnet_matvec_avx512(const uint8_t* packed_weights, const float* input, float* output,
+                          int rows, int cols, const uint16_t* scale_factors);
+
+/// NEON implementation (AArch64, NEON is baseline).
+void bitnet_matvec_neon(const uint8_t* packed_weights, const float* input, float* output,
+                        int rows, int cols, const uint16_t* scale_factors);
+
 }  // namespace nos

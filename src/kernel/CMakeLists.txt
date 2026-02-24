@@ -1,8 +1,22 @@
 # ── nos_kernel: BitNet b1.58 ternary compute kernels ─────────────────────────
 
-add_library(nos_kernel STATIC
+set(KERNEL_SOURCES
     bitnet_dispatch.cpp
+    bitnet_scalar.cpp
+    packing.cpp
 )
+
+# ── Per-ISA source files with isolated compile flags ────────────────────────
+
+if(NOS_HAS_AVX512)
+    list(APPEND KERNEL_SOURCES bitnet_avx512.cpp)
+endif()
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+    list(APPEND KERNEL_SOURCES bitnet_neon.cpp)
+endif()
+
+add_library(nos_kernel STATIC ${KERNEL_SOURCES})
 
 target_include_directories(nos_kernel
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
@@ -15,11 +29,15 @@ target_link_libraries(nos_kernel
     PUBLIC nos_format
 )
 
-# ── Per-ISA compile flags ───────────────────────────────────────────────────
-# Files matching *_avx512.cpp get AVX-512 flags (added by Plan 02)
-# Files matching *_neon.cpp get no extra flags on AArch64 (NEON is baseline)
-#
-# Example for Plan 02:
-#   set_source_files_properties(bitnet_avx512.cpp PROPERTIES
-#       COMPILE_FLAGS "-mavx512f -mavx512bw"
-#   )
+# ── Per-ISA compile flags (isolated per translation unit) ───────────────────
+
+if(NOS_HAS_AVX512)
+    set_source_files_properties(bitnet_avx512.cpp PROPERTIES
+        COMPILE_FLAGS "-mavx512f -mavx512bw"
+    )
+    target_compile_definitions(nos_kernel PRIVATE NOS_HAS_AVX512_COMPILED=1)
+endif()
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+    target_compile_definitions(nos_kernel PRIVATE NOS_HAS_NEON_COMPILED=1)
+endif()

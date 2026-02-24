@@ -86,6 +86,22 @@ target_include_directories(bench_packing
 # Run manually: ./build/tests/bench_packing --benchmark-no-analysis
 catch_discover_tests(bench_packing)
 
+# ── BitNet Kernel Benchmark ──────────────────────────────────────────────────
+add_executable(bench_bitnet_kernel bench_bitnet_kernel.cpp)
+
+target_link_libraries(bench_bitnet_kernel
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_kernel
+)
+
+target_include_directories(bench_bitnet_kernel
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/kernel
+)
+
+catch_discover_tests(bench_bitnet_kernel)
+
 # ── CRC32 Tests ─────────────────────────────────────────────────────────────
 add_executable(test_crc32 test_crc32.cpp)
 
