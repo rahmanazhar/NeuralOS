@@ -149,3 +149,25 @@ target_include_directories(test_tokenizer
 )
 
 catch_discover_tests(test_tokenizer)
+
+# ── Slab Allocator Tests ─────────────────────────────────────────────────
+add_executable(test_slab_allocator test_slab_allocator.cpp)
+
+target_link_libraries(test_slab_allocator
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_vmm
+)
+
+catch_discover_tests(test_slab_allocator)
+
+# ── CLOCK-Pro Tests ──────────────────────────────────────────────────────
+add_executable(test_clock_pro test_clock_pro.cpp)
+
+target_link_libraries(test_clock_pro
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_vmm
+)
+
+catch_discover_tests(test_clock_pro)
