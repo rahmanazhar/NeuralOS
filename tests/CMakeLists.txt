@@ -171,3 +171,14 @@ target_link_libraries(test_clock_pro
 )
 
 catch_discover_tests(test_clock_pro)
+
+# ── VMM Tests ────────────────────────────────────────────────────────────
+add_executable(test_vmm test_vmm.cpp)
+
+target_link_libraries(test_vmm
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_vmm
+)
+
+catch_discover_tests(test_vmm)

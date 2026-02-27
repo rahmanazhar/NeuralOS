@@ -3,6 +3,7 @@
 add_library(nos_vmm STATIC
     slab_allocator.cpp
     clock_pro.cpp
+    vmm.cpp
 )
 
 target_include_directories(nos_vmm PUBLIC ${CMAKE_SOURCE_DIR}/src)

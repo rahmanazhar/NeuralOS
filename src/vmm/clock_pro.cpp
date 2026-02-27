@@ -135,12 +135,14 @@ void ClockPro::insert(uint32_t page_index) {
                 if (nonresident_count_ > 0) --nonresident_count_;
             }
             node.resident = true;
-            node.referenced = false;
+            // If promoted to hot, set referenced=true to protect from hand_hot demotion
+            node.referenced = node.hot;
             ++resident_count_;
 
-            if (resident_count_ > max_resident_) {
-                evict_one();
-            }
+            // Note: do NOT call evict_one() internally. The VMM is
+            // responsible for evicting before calling insert(). If
+            // resident_count > max_resident, it will be resolved by
+            // the VMM on the next load_expert call.
             return;
         }
         // Already resident: mark accessed
@@ -148,10 +150,8 @@ void ClockPro::insert(uint32_t page_index) {
         return;
     }
 
-    // Evict if at capacity
-    if (resident_count_ >= max_resident_) {
-        evict_one();
-    }
+    // Note: do NOT call evict_one() here. The VMM handles eviction
+    // before calling insert(). CLOCK-Pro tracks metadata only.
 
     // Allocate new node
     int idx = alloc_node();
@@ -191,12 +191,22 @@ uint32_t ClockPro::evict_one() {
 
     if (hand_cold_ == -1) hand_cold_ = head_;
 
-    // Limit iterations to prevent infinite loops
+    // Limit iterations to prevent infinite loops.
+    // After one full sweep, if no cold page found, demote a hot page.
     size_t max_iterations = list_size_ * 3;
     size_t iterations = 0;
+    bool demoted_once = false;
 
     while (iterations < max_iterations) {
         if (hand_cold_ == -1) break;
+
+        // After scanning all entries once without finding an evictable cold page,
+        // run hand_hot to demote one hot page to cold, then continue scanning.
+        if (!demoted_once && iterations >= list_size_ && hot_count_ > 0) {
+            run_hand_hot();
+            demoted_once = true;
+        }
+
         auto& node = pool_[static_cast<size_t>(hand_cold_)];
         ++iterations;
 
@@ -214,11 +224,12 @@ uint32_t ClockPro::evict_one() {
 
         // Cold resident page
         if (node.referenced) {
-            // Referenced cold page in test period: promote to hot
+            // Referenced cold page in test period: promote to hot.
+            // Keep referenced=true so hand_hot won't immediately demote.
             if (node.in_test) {
                 node.hot = true;
                 node.in_test = false;
-                node.referenced = false;
+                // referenced stays true (already set)
                 ++hot_count_;
                 if (cold_target_ < max_resident_) {
                     ++cold_target_;
@@ -242,13 +253,6 @@ uint32_t ClockPro::evict_one() {
         ++nonresident_count_;
 
         hand_cold_ = advance_hand(hand_cold_);
-
-        // Run hand_hot if cold resident count drops below target
-        size_t cold_resident = resident_count_ > hot_count_
-                               ? resident_count_ - hot_count_ : 0;
-        if (cold_resident < cold_target_ && hot_count_ > 0) {
-            run_hand_hot();
-        }
 
         // Clean up non-resident if too many
         if (nonresident_count_ > max_nonresident_) {
@@ -308,31 +312,23 @@ void ClockPro::mark_accessed(uint32_t page_index) {
 
     if (!node.resident) {
         // Non-resident access during test period: promote to hot
+        // Note: VMM should only call mark_accessed for resident pages.
+        // If called for non-resident, we update metadata only. The VMM
+        // handles the actual loading and capacity management via insert().
         if (node.in_test) {
-            node.resident = true;
-            node.hot = true;
-            node.in_test = false;
-            node.referenced = false;
-            if (nonresident_count_ > 0) --nonresident_count_;
-            ++resident_count_;
-            ++hot_count_;
-
-            if (cold_target_ < max_resident_) {
-                ++cold_target_;
-            }
-
-            if (resident_count_ > max_resident_) {
-                evict_one();
-            }
+            // Record the promotion intent. When the VMM calls insert()
+            // for this page, it will see in_test and promote to hot.
+            // Don't mark as resident here -- that's the VMM's job.
         }
         return;
     }
 
-    // Resident cold page in test period: promote to hot immediately
+    // Resident cold page in test period: promote to hot immediately.
+    // Set referenced=true so that hand_hot won't immediately demote it.
     if (!node.hot && node.in_test) {
         node.hot = true;
         node.in_test = false;
-        node.referenced = false;
+        node.referenced = true;
         ++hot_count_;
         if (cold_target_ < max_resident_) {
             ++cold_target_;
@@ -368,7 +364,10 @@ void ClockPro::run_hand_hot() {
     if (list_size_ == 0 || hot_count_ == 0) return;
     if (hand_hot_ == -1) hand_hot_ = head_;
 
-    size_t max_iterations = list_size_ * 2;
+    // Sweep at most once around the list to find ONE unreferenced hot page
+    // to demote. Referenced hot pages have their bit cleared but are not
+    // demoted in this sweep -- they get another chance until the next sweep.
+    size_t max_iterations = list_size_;  // one full sweep maximum
     size_t iterations = 0;
 
     while (iterations < max_iterations && hot_count_ > 0) {
@@ -382,6 +381,9 @@ void ClockPro::run_hand_hot() {
         }
 
         if (node.referenced) {
+            // Clear referenced bit; page keeps hot status for now.
+            // It will be demoted on the NEXT run_hand_hot sweep
+            // if it hasn't been accessed again by then.
             node.referenced = false;
             hand_hot_ = advance_hand(hand_hot_);
             continue;
