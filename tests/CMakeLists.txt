@@ -182,3 +182,14 @@ target_link_libraries(test_vmm
 )
 
 catch_discover_tests(test_vmm)
+
+# ── Memory Budget Tests ────────────────────────────────────────────────
+add_executable(test_memory_budget test_memory_budget.cpp)
+
+target_link_libraries(test_memory_budget
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_vmm
+)
+
+catch_discover_tests(test_memory_budget)
