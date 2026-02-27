@@ -5,6 +5,10 @@
 /// buffers, and manages eviction via CLOCK-Pro. Per-page atomic state tracks
 /// EVICTED/LOADING/RESIDENT/CACHED transitions. Opaque handles with generation
 /// counters detect stale references after eviction+reload cycles.
+///
+/// Budget-aware factory (Vmm::create) reads .nxp header, computes budget
+/// partition, validates sufficiency, pre-allocates KV cache, and tracks
+/// runtime statistics (hit rate, eviction count, etc.).
 
 #include "vmm/vmm.h"
 #include "vmm/memory_budget.h"
@@ -16,8 +20,10 @@
 #include "io/platform_io.h"
 
 #include <atomic>
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -57,6 +63,15 @@ public:
     size_t cached_count() const;
     size_t load_count() const;
 
+    // Budget-aware extensions
+    VmmStats stats() const;
+    const BudgetPartition& budget() const { return budget_; }
+    void set_budget(const BudgetPartition& bp) { budget_ = bp; }
+
+    void* kv_cache_base() const { return kv_cache_; }
+    size_t kv_cache_size() const { return kv_cache_bytes_; }
+    void allocate_kv_cache(size_t bytes);
+
 private:
     void load_expert(uint32_t page_index);
     void do_evict(uint32_t page_index);
@@ -79,8 +94,20 @@ private:
     uint32_t total_experts_{0};
     size_t slot_count_{0};
 
-    // Load counter for testing
+    // Load counter for testing (backward compat)
     std::atomic<size_t> load_count_{0};
+
+    // ── Runtime statistics ──────────────────────────────────────────────
+    std::atomic<uint64_t> stat_total_pins_{0};
+    std::atomic<uint64_t> stat_cache_hits_{0};
+    std::atomic<uint64_t> stat_cache_misses_{0};
+    std::atomic<uint64_t> stat_evictions_{0};
+    std::atomic<uint64_t> stat_crc_failures_{0};
+
+    // ── Budget and KV cache ─────────────────────────────────────────────
+    BudgetPartition budget_{};
+    void* kv_cache_{nullptr};
+    size_t kv_cache_bytes_{0};
 };
 
 VmmImpl::VmmImpl(VmmConfig config) : config_(std::move(config)) {
@@ -151,6 +178,29 @@ VmmImpl::~VmmImpl() {
         ::close(nxp_fd_);
         nxp_fd_ = -1;
     }
+    if (kv_cache_) {
+        ::free(kv_cache_);
+        kv_cache_ = nullptr;
+    }
+}
+
+void VmmImpl::allocate_kv_cache(size_t bytes) {
+    if (bytes == 0) return;
+    // 64-byte aligned contiguous allocation
+    kv_cache_bytes_ = bytes;
+#if defined(__APPLE__) || defined(_WIN32)
+    // posix_memalign or aligned allocation
+    void* ptr = nullptr;
+    if (::posix_memalign(&ptr, 64, bytes) != 0) {
+        ptr = nullptr;
+    }
+    kv_cache_ = ptr;
+#else
+    kv_cache_ = std::aligned_alloc(64, bytes);
+#endif
+    if (kv_cache_) {
+        std::memset(kv_cache_, 0, bytes);
+    }
 }
 
 ExpertHandle VmmImpl::get_handle(uint32_t layer_id, uint32_t expert_id) const {
@@ -174,6 +224,9 @@ const uint8_t* VmmImpl::pin(ExpertHandle handle) {
         return nullptr;
     }
 
+    // Track total pins
+    stat_total_pins_.fetch_add(1, std::memory_order_relaxed);
+
     // Check current state
     auto state = static_cast<PageState>(page.state.load(std::memory_order_acquire));
 
@@ -184,8 +237,12 @@ const uint8_t* VmmImpl::pin(ExpertHandle handle) {
 
     if (state == PageState::EVICTED) {
         // Cache miss: load from NVMe
+        stat_cache_misses_.fetch_add(1, std::memory_order_relaxed);
         load_expert(handle.index);
         state = static_cast<PageState>(page.state.load(std::memory_order_acquire));
+    } else if (state == PageState::RESIDENT || state == PageState::CACHED) {
+        // Cache hit: already in RAM
+        stat_cache_hits_.fetch_add(1, std::memory_order_relaxed);
     }
 
     if (state == PageState::RESIDENT || state == PageState::CACHED) {
@@ -253,6 +310,35 @@ size_t VmmImpl::cached_count() const {
 
 size_t VmmImpl::load_count() const {
     return load_count_.load(std::memory_order_relaxed);
+}
+
+VmmStats VmmImpl::stats() const {
+    VmmStats s{};
+    s.total_pins    = stat_total_pins_.load(std::memory_order_relaxed);
+    s.cache_hits    = stat_cache_hits_.load(std::memory_order_relaxed);
+    s.cache_misses  = stat_cache_misses_.load(std::memory_order_relaxed);
+    s.evictions     = stat_evictions_.load(std::memory_order_relaxed);
+    s.crc_failures  = stat_crc_failures_.load(std::memory_order_relaxed);
+
+    // Compute current page counts
+    uint32_t resident = 0, cached = 0, evicted = 0;
+    for (uint32_t i = 0; i < total_experts_; ++i) {
+        auto st = static_cast<PageState>(
+            page_table_[i].state.load(std::memory_order_relaxed));
+        switch (st) {
+            case PageState::RESIDENT: ++resident; break;
+            case PageState::CACHED:   ++cached; break;
+            case PageState::EVICTED:  ++evicted; break;
+            default: break;
+        }
+    }
+    s.resident_pages = resident;
+    s.cached_pages   = cached;
+    s.evicted_pages  = evicted;
+    s.hit_rate = (s.total_pins > 0)
+                 ? static_cast<double>(s.cache_hits) / static_cast<double>(s.total_pins)
+                 : 0.0;
+    return s;
 }
 
 void VmmImpl::load_expert(uint32_t page_index) {
@@ -328,6 +414,7 @@ void VmmImpl::load_expert(uint32_t page_index) {
     uint32_t computed_crc = crc32c(buf, static_cast<size_t>(page.weight_size));
     if (computed_crc != page.crc32_expected) {
         // CRC mismatch -- data corruption
+        stat_crc_failures_.fetch_add(1, std::memory_order_relaxed);
         slab_->free(slot);
         page.state.store(static_cast<uint8_t>(PageState::EVICTED),
                          std::memory_order_release);
@@ -364,6 +451,9 @@ void VmmImpl::do_evict(uint32_t page_index) {
     // Transition to EVICTED
     page.state.store(static_cast<uint8_t>(PageState::EVICTED),
                      std::memory_order_release);
+
+    // Track eviction
+    stat_evictions_.fetch_add(1, std::memory_order_relaxed);
 }
 
 // ── Vmm public interface (delegates to VmmImpl) ─────────────────────────────
@@ -412,28 +502,96 @@ size_t Vmm::load_count() const {
     return impl_->load_count();
 }
 
-// ── Budget-aware factory and new methods (stubs for RED phase) ───────────────
-
-std::unique_ptr<Vmm> Vmm::create(const VmmFullConfig& /*config*/) {
-    return nullptr;  // Stub -- tests should fail
-}
-
 VmmStats Vmm::stats() const {
-    VmmStats s{};
-    return s;  // Stub
+    return impl_->stats();
 }
 
 const BudgetPartition& Vmm::budget() const {
-    static BudgetPartition empty{};
-    return empty;  // Stub
+    return impl_->budget();
 }
 
 void* Vmm::kv_cache_base() const {
-    return nullptr;  // Stub
+    return impl_->kv_cache_base();
 }
 
 size_t Vmm::kv_cache_size() const {
-    return 0;  // Stub
+    return impl_->kv_cache_size();
+}
+
+// ── Vmm::create() factory ───────────────────────────────────────────────────
+
+std::unique_ptr<Vmm> Vmm::create(const VmmFullConfig& config) {
+    // Step 1: Open .nxp via NxpReader to get header
+    NxpReader reader;
+    if (!reader.open(config.nxp_path)) {
+        std::fprintf(stderr, "Error: Failed to open .nxp file: %s\n",
+                     config.nxp_path.c_str());
+        return nullptr;
+    }
+
+    const auto& hdr = reader.header();
+
+    // Step 2: Find max_expert_size by scanning entries
+    size_t max_expert_size = 0;
+    for (uint32_t l = 0; l < hdr.num_layers; ++l) {
+        for (uint32_t e = 0; e < hdr.experts_per_layer; ++e) {
+            const NxpExpertEntry* entry = reader.find_expert(l, e);
+            if (entry) {
+                size_t entry_size = entry->size + entry->scale_size;
+                if (entry_size > max_expert_size) {
+                    max_expert_size = entry_size;
+                }
+            }
+        }
+    }
+    // Align up to 64
+    max_expert_size = (max_expert_size + 63) & ~size_t(63);
+    reader.close();
+
+    // Step 3: Construct ModelParams from header + config
+    ModelParams params{};
+    params.n_layers          = hdr.num_layers;
+    params.n_kv_heads        = config.n_kv_heads;
+    params.head_dim          = config.head_dim;
+    params.hidden_dim        = hdr.hidden_dim;
+    params.max_expert_size   = static_cast<uint32_t>(
+        std::min(max_expert_size, static_cast<size_t>(UINT32_MAX)));
+    params.top_k             = config.top_k;
+    params.experts_per_layer = hdr.experts_per_layer;
+
+    // Step 4: Compute budget
+    BudgetPartition bp = compute_budget(
+        config.user_budget_bytes, params, config.desired_context_length);
+
+    // Step 5: Validate
+    if (!bp.sufficient) {
+        std::string report = format_budget_report(bp, params);
+        std::fprintf(stderr, "%s", report.c_str());
+        return nullptr;
+    }
+
+    // Step 6: Print budget report to stderr (always, for visibility)
+    {
+        std::string report = format_budget_report(bp, params);
+        std::fprintf(stderr, "%s", report.c_str());
+    }
+
+    // Step 7: Construct VmmConfig from budget
+    VmmConfig vmm_config{};
+    vmm_config.expert_cache_bytes = bp.expert_cache;
+    vmm_config.max_expert_size    = max_expert_size;
+    vmm_config.num_layers         = hdr.num_layers;
+    vmm_config.experts_per_layer  = hdr.experts_per_layer;
+    vmm_config.nxp_path           = config.nxp_path;
+
+    // Step 8: Create VMM and set budget
+    auto vmm = std::make_unique<Vmm>(std::move(vmm_config));
+    vmm->impl_->set_budget(bp);
+
+    // Step 9: Allocate KV cache (contiguous, pre-reserved)
+    vmm->impl_->allocate_kv_cache(bp.kv_cache);
+
+    return vmm;
 }
 
 }  // namespace nos

@@ -94,12 +94,12 @@ struct TestNxp {
 // ═══════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("VmmBudget: sufficient budget creates VMM", "[vmm_budget]") {
-    // 4 layers * 8 experts, expert_size ~1KB each. Budget = 512MB.
+    // 4 layers * 8 experts, expert_size ~1KB each. Budget = 1GB (generous).
     TestNxp nxp(4, 8, 1024, 32);
 
     nos::VmmFullConfig cfg{};
     cfg.nxp_path = nxp.path;
-    cfg.user_budget_bytes = 512 * MB;
+    cfg.user_budget_bytes = 1 * GB;
     cfg.desired_context_length = 512;
 
     auto vmm = nos::Vmm::create(cfg);
@@ -107,7 +107,7 @@ TEST_CASE("VmmBudget: sufficient budget creates VMM", "[vmm_budget]") {
 
     CHECK(vmm->budget().sufficient == true);
     CHECK(vmm->budget().expert_slots > 0);
-    CHECK(vmm->budget().total == 512 * MB);
+    CHECK(vmm->budget().total == 1 * GB);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -135,7 +135,7 @@ TEST_CASE("VmmBudget: partition sums match total", "[vmm_budget]") {
 
     nos::VmmFullConfig cfg{};
     cfg.nxp_path = nxp.path;
-    cfg.user_budget_bytes = 512 * MB;
+    cfg.user_budget_bytes = 1 * GB;
     cfg.desired_context_length = 512;
 
     auto vmm = nos::Vmm::create(cfg);
@@ -145,7 +145,9 @@ TEST_CASE("VmmBudget: partition sums match total", "[vmm_budget]") {
     size_t sum = bp.expert_cache + bp.kv_cache + bp.working_buffers + bp.os_overhead;
     // Sum should be <= total; difference is the fractional slot remainder
     CHECK(sum <= bp.total);
-    CHECK(bp.total - sum < nxp.max_expert_size);
+    // The remainder should be less than one expert slot
+    size_t max_es = nxp.max_expert_size;
+    CHECK(bp.total - sum < max_es);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -157,7 +159,7 @@ TEST_CASE("VmmBudget: KV cache allocated", "[vmm_budget]") {
 
     nos::VmmFullConfig cfg{};
     cfg.nxp_path = nxp.path;
-    cfg.user_budget_bytes = 512 * MB;
+    cfg.user_budget_bytes = 1 * GB;
     cfg.desired_context_length = 512;
 
     auto vmm = nos::Vmm::create(cfg);
@@ -173,27 +175,23 @@ TEST_CASE("VmmBudget: KV cache allocated", "[vmm_budget]") {
 // ═══════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("VmmBudget: statistics track pins, misses, evictions", "[vmm_budget]") {
-    // 2 layers * 4 experts = 8 experts, cache fits only 4 slots
+    // 2 layers * 4 experts = 8 experts, we want cache fits only 4 slots.
+    // Use the low-level VmmConfig constructor to get precise cache sizing,
+    // then verify statistics tracking works.
     TestNxp nxp(2, 4, 512, 16);
 
-    nos::VmmFullConfig cfg{};
-    cfg.nxp_path = nxp.path;
-    // Budget: 512MB overhead + working + kv + 4 expert slots
-    // The budget formula will compute expert_cache from the remainder
-    // We want ~4 slots: expert_cache ~ 4 * max_expert_size
-    size_t os = 512 * MB;
-    size_t working = (256 * sizeof(float) * 3 * 2 + 63) & ~size_t(63);
-    // kv_per_token for these defaults (n_kv_heads=8, head_dim=128): small
-    // But we're using VmmFullConfig defaults, so we set budget conservatively
-    cfg.nxp_path = nxp.path;
-    cfg.user_budget_bytes = os + working + 4 * nxp.max_expert_size + 1 * MB;
-    cfg.desired_context_length = 32;
+    // Use low-level VmmConfig for precise control: exactly 4 slots
+    nos::VmmConfig low_cfg{};
+    low_cfg.expert_cache_bytes = nxp.max_expert_size * 4;
+    low_cfg.max_expert_size = nxp.max_expert_size;
+    low_cfg.num_layers = nxp.num_layers;
+    low_cfg.experts_per_layer = nxp.experts_per_layer;
+    low_cfg.nxp_path = nxp.path;
 
-    auto vmm = nos::Vmm::create(cfg);
-    REQUIRE(vmm != nullptr);
+    nos::Vmm vmm_obj(low_cfg);
 
     // Check initial stats
-    auto s0 = vmm->stats();
+    auto s0 = vmm_obj.stats();
     CHECK(s0.total_pins == 0);
     CHECK(s0.cache_hits == 0);
     CHECK(s0.cache_misses == 0);
@@ -202,18 +200,20 @@ TEST_CASE("VmmBudget: statistics track pins, misses, evictions", "[vmm_budget]")
     // Access all 8 experts -- first 4 are cold misses, rest force evictions
     for (uint32_t l = 0; l < nxp.num_layers; ++l) {
         for (uint32_t e = 0; e < nxp.experts_per_layer; ++e) {
-            auto h = vmm->get_handle(l, e);
+            auto h = vmm_obj.get_handle(l, e);
             REQUIRE(h != nos::INVALID_HANDLE);
-            const uint8_t* data = vmm->pin(h);
+            const uint8_t* data = vmm_obj.pin(h);
             REQUIRE(data != nullptr);
-            vmm->unpin(h);
+            vmm_obj.unpin(h);
         }
     }
 
-    auto s1 = vmm->stats();
+    auto s1 = vmm_obj.stats();
     CHECK(s1.total_pins == 8);
-    CHECK(s1.cache_misses >= 4);  // At least first 4 are misses
-    CHECK(s1.evictions >= 4);     // Need evictions to load experts 5-8
+    // All 8 are cold misses (first access for each expert)
+    CHECK(s1.cache_misses == 8);
+    // At least 4 evictions needed to fit 8 experts in 4 slots
+    CHECK(s1.evictions >= 4);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -226,7 +226,7 @@ TEST_CASE("VmmBudget: repeated access improves hit rate", "[vmm_budget]") {
 
     nos::VmmFullConfig cfg{};
     cfg.nxp_path = nxp.path;
-    cfg.user_budget_bytes = 512 * MB;  // Generous
+    cfg.user_budget_bytes = 1 * GB;  // Generous
     cfg.desired_context_length = 32;
 
     auto vmm = nos::Vmm::create(cfg);
@@ -261,7 +261,7 @@ TEST_CASE("VmmBudget: repeated access improves hit rate", "[vmm_budget]") {
 // ═══════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("VmmBudget: format_budget_report content", "[vmm_budget]") {
-    // Sufficient
+    // Sufficient: use a large enough budget to exceed os_overhead + kv + min experts
     nos::ModelParams p{};
     p.n_layers = 4;
     p.n_kv_heads = 8;
@@ -271,7 +271,11 @@ TEST_CASE("VmmBudget: format_budget_report content", "[vmm_budget]") {
     p.top_k = 2;
     p.experts_per_layer = 8;
 
-    auto bp_ok = nos::compute_budget(512 * MB, p, 512);
+    // kv_per_token = 2 * 4 * 8 * 128 * 2 = 16384
+    // kv_cache = 16384 * 512 = 8 MB
+    // os_overhead = 512 MB, min experts = 4 * 1MB = 4MB
+    // Total minimum ~ 524MB. Use 1GB to be safe.
+    auto bp_ok = nos::compute_budget(1 * GB, p, 512);
     REQUIRE(bp_ok.sufficient == true);
     std::string report_ok = nos::format_budget_report(bp_ok, p);
     CHECK_THAT(report_ok, ContainsSubstring("Expert cache:"));
