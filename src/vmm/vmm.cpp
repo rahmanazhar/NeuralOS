@@ -7,6 +7,7 @@
 /// counters detect stale references after eviction+reload cycles.
 
 #include "vmm/vmm.h"
+#include "vmm/memory_budget.h"
 #include "vmm/clock_pro.h"
 #include "vmm/slab_allocator.h"
 
@@ -16,6 +17,7 @@
 
 #include <atomic>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -369,6 +371,19 @@ void VmmImpl::do_evict(uint32_t page_index) {
 Vmm::Vmm(VmmConfig config) : impl_(new VmmImpl(std::move(config))) {}
 Vmm::~Vmm() { delete impl_; }
 
+Vmm::Vmm(Vmm&& other) noexcept : impl_(other.impl_) {
+    other.impl_ = nullptr;
+}
+
+Vmm& Vmm::operator=(Vmm&& other) noexcept {
+    if (this != &other) {
+        delete impl_;
+        impl_ = other.impl_;
+        other.impl_ = nullptr;
+    }
+    return *this;
+}
+
 ExpertHandle Vmm::get_handle(uint32_t layer_id, uint32_t expert_id) const {
     return impl_->get_handle(layer_id, expert_id);
 }
@@ -395,6 +410,30 @@ size_t Vmm::cached_count() const {
 
 size_t Vmm::load_count() const {
     return impl_->load_count();
+}
+
+// ── Budget-aware factory and new methods (stubs for RED phase) ───────────────
+
+std::unique_ptr<Vmm> Vmm::create(const VmmFullConfig& /*config*/) {
+    return nullptr;  // Stub -- tests should fail
+}
+
+VmmStats Vmm::stats() const {
+    VmmStats s{};
+    return s;  // Stub
+}
+
+const BudgetPartition& Vmm::budget() const {
+    static BudgetPartition empty{};
+    return empty;  // Stub
+}
+
+void* Vmm::kv_cache_base() const {
+    return nullptr;  // Stub
+}
+
+size_t Vmm::kv_cache_size() const {
+    return 0;  // Stub
 }
 
 }  // namespace nos

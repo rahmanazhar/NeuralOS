@@ -193,3 +193,14 @@ target_link_libraries(test_memory_budget
 )
 
 catch_discover_tests(test_memory_budget)
+
+# ── VMM Budget Integration Tests ──────────────────────────────────────
+add_executable(test_vmm_budget test_vmm_budget.cpp)
+
+target_link_libraries(test_vmm_budget
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_vmm
+)
+
+catch_discover_tests(test_vmm_budget)
