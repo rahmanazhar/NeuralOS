@@ -248,3 +248,14 @@ target_link_libraries(test_quantizer
 )
 
 catch_discover_tests(test_quantizer)
+
+# ── Conversion Pipeline Tests ────────────────────────────────────────
+add_executable(test_conversion_pipeline test_conversion_pipeline.cpp)
+
+target_link_libraries(test_conversion_pipeline
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_converter
+)
+
+catch_discover_tests(test_conversion_pipeline)

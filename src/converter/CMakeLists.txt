@@ -7,6 +7,8 @@ add_library(nos_converter STATIC
     kmeans.cpp
     activation_collector.cpp
     quantizer.cpp
+    router_calibrator.cpp
+    conversion_pipeline.cpp
 )
 
 target_include_directories(nos_converter PUBLIC ${CMAKE_SOURCE_DIR}/src)
