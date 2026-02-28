@@ -39,6 +39,13 @@ if(NOT sentencepiece_POPULATED)
     )
 endif()
 
+# ── nlohmann/json ──────────────────────────────────────────────────────────
+
+FetchContent_Declare(json
+    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+)
+FetchContent_MakeAvailable(json)
+
 # ── liburing (Linux only) ──────────────────────────────────────────────────
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

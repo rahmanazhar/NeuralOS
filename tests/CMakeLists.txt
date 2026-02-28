@@ -204,3 +204,36 @@ target_link_libraries(test_vmm_budget
 )
 
 catch_discover_tests(test_vmm_budget)
+
+# ── SafeTensors Reader Tests ─────────────────────────────────────────
+add_executable(test_safetensors_reader test_safetensors_reader.cpp)
+
+target_link_libraries(test_safetensors_reader
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_converter
+)
+
+catch_discover_tests(test_safetensors_reader)
+
+# ── GGUF Reader Tests ────────────────────────────────────────────────
+add_executable(test_gguf_reader test_gguf_reader.cpp)
+
+target_link_libraries(test_gguf_reader
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_converter
+)
+
+catch_discover_tests(test_gguf_reader)
+
+# ── Model Config Tests ───────────────────────────────────────────────
+add_executable(test_model_config test_model_config.cpp)
+
+target_link_libraries(test_model_config
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_converter
+)
+
+catch_discover_tests(test_model_config)
