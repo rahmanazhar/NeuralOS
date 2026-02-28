@@ -237,3 +237,14 @@ target_link_libraries(test_model_config
 )
 
 catch_discover_tests(test_model_config)
+
+# ── Quantizer Tests ──────────────────────────────────────────────────
+add_executable(test_quantizer test_quantizer.cpp)
+
+target_link_libraries(test_quantizer
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_converter
+)
+
+catch_discover_tests(test_quantizer)

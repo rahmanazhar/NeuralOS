@@ -4,6 +4,9 @@ add_library(nos_converter STATIC
     safetensors_reader.cpp
     gguf_reader.cpp
     model_reader.cpp
+    kmeans.cpp
+    activation_collector.cpp
+    quantizer.cpp
 )
 
 target_include_directories(nos_converter PUBLIC ${CMAKE_SOURCE_DIR}/src)
