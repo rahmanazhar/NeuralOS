@@ -259,3 +259,47 @@ target_link_libraries(test_conversion_pipeline
 )
 
 catch_discover_tests(test_conversion_pipeline)
+
+# ── RMSNorm Tests ───────────────────────────────────────────────────
+add_executable(test_rmsnorm test_rmsnorm.cpp)
+
+target_link_libraries(test_rmsnorm
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_engine
+)
+
+catch_discover_tests(test_rmsnorm)
+
+# ── RoPE Tests ──────────────────────────────────────────────────────
+add_executable(test_rope test_rope.cpp)
+
+target_link_libraries(test_rope
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_engine
+)
+
+catch_discover_tests(test_rope)
+
+# ── Attention Tests ─────────────────────────────────────────────────
+add_executable(test_attention test_attention.cpp)
+
+target_link_libraries(test_attention
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_engine
+)
+
+catch_discover_tests(test_attention)
+
+# ── Router Tests ────────────────────────────────────────────────────
+add_executable(test_router test_router.cpp)
+
+target_link_libraries(test_router
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_engine
+)
+
+catch_discover_tests(test_router)
