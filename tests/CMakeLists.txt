@@ -325,3 +325,14 @@ target_link_libraries(test_sampling
 )
 
 catch_discover_tests(test_sampling)
+
+# ── End-to-End Synthetic Tests ─────────────────────────────────────
+add_executable(test_e2e_synthetic test_e2e_synthetic.cpp)
+
+target_link_libraries(test_e2e_synthetic
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_engine
+)
+
+catch_discover_tests(test_e2e_synthetic)
