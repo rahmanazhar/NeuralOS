@@ -7,6 +7,7 @@ add_library(nos_engine STATIC
     router.cpp
     inference_engine.cpp
     perplexity.cpp
+    sampling.cpp
 )
 
 target_include_directories(nos_engine PUBLIC ${CMAKE_SOURCE_DIR}/src)
