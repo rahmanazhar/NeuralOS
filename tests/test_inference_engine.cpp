@@ -104,31 +104,48 @@ SyntheticModel create_synthetic_model() {
         for (uint32_t E = 0; E < TEST_EXPERT_COUNT; E++) {
             // Expert rows = intermediate_dim / expert_count
             int expert_rows = static_cast<int>(TEST_INTERMEDIATE_DIM / TEST_EXPERT_COUNT);
-            int total_rows = expert_rows * 2;  // gate + up
-            int packed_cols = (static_cast<int>(TEST_HIDDEN_DIM) + 4) / 5;
+            int gu_rows = expert_rows * 2;  // gate + up
+            int packed_cols_gu = (static_cast<int>(TEST_HIDDEN_DIM) + 4) / 5;
+            int down_rows = static_cast<int>(TEST_HIDDEN_DIM);
+            int packed_cols_down = (expert_rows + 4) / 5;
 
-            // Generate random ternary weights
-            std::vector<int8_t> trits(sz(total_rows) * sz(TEST_HIDDEN_DIM));
+            // Generate random ternary weights for gate+up
+            std::vector<int8_t> gu_trits(sz(gu_rows) * sz(TEST_HIDDEN_DIM));
             std::uniform_int_distribution<int> trit_dist(-1, 1);
-            for (auto& t : trits) t = static_cast<int8_t>(trit_dist(rng));
+            for (auto& t : gu_trits) t = static_cast<int8_t>(trit_dist(rng));
 
-            // Pack them
-            std::vector<uint8_t> packed(sz(total_rows) * sz(packed_cols));
-            for (int r = 0; r < total_rows; r++) {
-                nos::pack_row(trits.data() + sz(r) * sz(TEST_HIDDEN_DIM),
+            std::vector<uint8_t> gu_packed(sz(gu_rows) * sz(packed_cols_gu));
+            for (int r = 0; r < gu_rows; r++) {
+                nos::pack_row(gu_trits.data() + sz(r) * sz(TEST_HIDDEN_DIM),
                              static_cast<int>(TEST_HIDDEN_DIM),
-                             packed.data() + sz(r) * sz(packed_cols));
+                             gu_packed.data() + sz(r) * sz(packed_cols_gu));
             }
 
-            // Random FP16 scale factors
-            std::vector<uint16_t> scales(sz(total_rows));
-            for (auto& s : scales) {
+            // Generate random ternary weights for down_proj [hidden_dim x expert_rows]
+            std::vector<int8_t> down_trits(sz(down_rows) * sz(expert_rows));
+            for (auto& t : down_trits) t = static_cast<int8_t>(trit_dist(rng));
+
+            std::vector<uint8_t> down_packed(sz(down_rows) * sz(packed_cols_down));
+            for (int r = 0; r < down_rows; r++) {
+                nos::pack_row(down_trits.data() + sz(r) * sz(expert_rows),
+                             expert_rows,
+                             down_packed.data() + sz(r) * sz(packed_cols_down));
+            }
+
+            // Concatenate packed data: [gate+up | down]
+            std::vector<uint8_t> all_packed;
+            all_packed.insert(all_packed.end(), gu_packed.begin(), gu_packed.end());
+            all_packed.insert(all_packed.end(), down_packed.begin(), down_packed.end());
+
+            // Concatenate scales: [gate+up scales | down scales]
+            uint32_t total_channels = static_cast<uint32_t>(gu_rows + down_rows);
+            std::vector<uint16_t> all_scales(sz(total_channels));
+            for (auto& s : all_scales) {
                 s = nos::fp32_to_fp16(std::abs(dist(rng)) + 0.01f);
             }
 
-            auto entry = writer.write_expert(L, E, packed.data(), packed.size(),
-                                              scales.data(),
-                                              static_cast<uint32_t>(total_rows));
+            auto entry = writer.write_expert(L, E, all_packed.data(), all_packed.size(),
+                                              all_scales.data(), total_channels);
             if (entry.size > max_expert_bytes) max_expert_bytes = entry.size;
         }
 

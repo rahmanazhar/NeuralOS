@@ -487,13 +487,20 @@ const float* InferenceEngine::forward_step(int token_id, int pos) {
                     impl_->ffn_out[sz(i)] = silu * impl_->up_buf[sz(i)];
                 }
 
-                // Down projection would go here in a full implementation
-                // For now, we accumulate the gated output directly
-                // (down_proj maps expert_rows -> hidden_dim)
-                // Simplified: treat ffn_out as contribution to hidden_dim
-                int contrib_dim = std::min(expert_rows, hidden_dim);
-                for (int d = 0; d < contrib_dim; d++) {
-                    impl_->moe_out[sz(d)] += gate * impl_->ffn_out[sz(d)];
+                // Down projection: [hidden_dim x expert_rows] -> [hidden_dim]
+                // Packed data layout: [gate(er*pc)] [up(er*pc)] [down(hd*pcd)]
+                // Scales layout: [gate(er)] [up(er)] [down(hd)]
+                const uint8_t* down_packed = packed_weights
+                    + sz(expert_rows) * 2 * sz(packed_cols);
+                const uint16_t* down_scales = scale_factors
+                    + sz(expert_rows) * 2;
+
+                bitnet_matvec(down_packed,
+                             impl_->ffn_out.data(), impl_->expert_out.data(),
+                             hidden_dim, expert_rows, down_scales);
+
+                for (int d = 0; d < hidden_dim; d++) {
+                    impl_->moe_out[sz(d)] += gate * impl_->expert_out[sz(d)];
                 }
 
                 impl_->vmm->unpin(handle);

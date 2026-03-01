@@ -296,6 +296,10 @@ bool ConversionPipeline::run(const ConversionConfig& config) {
                 // down_proj: [hidden_dim x intermediate_dim] -- slice columns
                 // For simplicity in packing, we transpose the slice to [expert_rows x hidden_dim]
 
+                // down_proj: [hidden_dim x intermediate_dim] -- slice columns
+                std::vector<uint16_t> expert_down(static_cast<size_t>(hidden_dim)
+                                                 * static_cast<size_t>(expert_rows));
+
                 for (int r = 0; r < expert_rows; r++) {
                     uint32_t neuron_idx = indices[static_cast<size_t>(r)];
                     size_t src_offset = static_cast<size_t>(neuron_idx)
@@ -310,25 +314,52 @@ bool ConversionPipeline::run(const ConversionConfig& config) {
                                static_cast<size_t>(hidden_dim) * sizeof(uint16_t));
                 }
 
-                // 2d. Ternary quantize expert weights
-                // Concatenate gate and up for this expert: [2*expert_rows x hidden_dim]
-                int total_rows = expert_rows * 2;
-                std::vector<uint16_t> combined(static_cast<size_t>(total_rows)
-                                             * static_cast<size_t>(hidden_dim));
-                std::memcpy(combined.data(), expert_gate.data(),
+                // Slice down_proj columns: down_fp16[row * inter_dim + neuron_idx]
+                for (int r = 0; r < hidden_dim; r++) {
+                    for (int c = 0; c < expert_rows; c++) {
+                        uint32_t neuron_idx = indices[static_cast<size_t>(c)];
+                        expert_down[static_cast<size_t>(r) * static_cast<size_t>(expert_rows)
+                                   + static_cast<size_t>(c)] =
+                            down_fp16[static_cast<size_t>(r) * static_cast<size_t>(intermediate_dim)
+                                     + static_cast<size_t>(neuron_idx)];
+                    }
+                }
+
+                // 2d. Ternary quantize gate+up: [2*expert_rows x hidden_dim]
+                int gu_rows = expert_rows * 2;
+                std::vector<uint16_t> gu_combined(static_cast<size_t>(gu_rows)
+                                                 * static_cast<size_t>(hidden_dim));
+                std::memcpy(gu_combined.data(), expert_gate.data(),
                            expert_gate.size() * sizeof(uint16_t));
-                std::memcpy(combined.data() + expert_gate.size(), expert_up.data(),
+                std::memcpy(gu_combined.data() + expert_gate.size(), expert_up.data(),
                            expert_up.size() * sizeof(uint16_t));
 
-                auto quant = ternary_quantize(combined.data(), total_rows, hidden_dim);
-                layer_experts.push_back(quant);
+                auto gu_quant = ternary_quantize(gu_combined.data(), gu_rows, hidden_dim);
 
-                // 2f. Write expert to .nxp
+                // Ternary quantize down_proj: [hidden_dim x expert_rows]
+                auto down_quant = ternary_quantize(expert_down.data(), hidden_dim, expert_rows);
+
+                // Concatenate packed data: [gate+up packed] [down packed]
+                std::vector<uint8_t> all_packed;
+                all_packed.reserve(gu_quant.packed.size() + down_quant.packed.size());
+                all_packed.insert(all_packed.end(), gu_quant.packed.begin(), gu_quant.packed.end());
+                all_packed.insert(all_packed.end(), down_quant.packed.begin(), down_quant.packed.end());
+
+                // Concatenate scales: [gate+up scales] [down scales]
+                std::vector<uint16_t> all_scales;
+                all_scales.reserve(gu_quant.scales.size() + down_quant.scales.size());
+                all_scales.insert(all_scales.end(), gu_quant.scales.begin(), gu_quant.scales.end());
+                all_scales.insert(all_scales.end(), down_quant.scales.begin(), down_quant.scales.end());
+
+                uint32_t total_channels = static_cast<uint32_t>(gu_quant.rows + down_quant.rows);
+                layer_experts.push_back(gu_quant);
+
+                // 2f. Write expert to .nxp (gate+up+down packed data, combined scales)
                 auto entry = writer.write_expert(
                     static_cast<uint32_t>(layer),
                     static_cast<uint32_t>(e),
-                    quant.packed.data(), quant.packed.size(),
-                    quant.scales.data(), static_cast<uint32_t>(quant.rows));
+                    all_packed.data(), all_packed.size(),
+                    all_scales.data(), total_channels);
 
                 if (entry.size > impl_->largest_expert_bytes) {
                     impl_->largest_expert_bytes = entry.size;
@@ -459,6 +490,99 @@ bool ConversionPipeline::run(const ConversionConfig& config) {
                 nullptr, 0);
         }
         break;
+    }
+
+    // --- Stage 4b: Write RMSNorm weights ---
+    std::fprintf(stderr, "INFO: Stage 4b/5: Writing RMSNorm weights...\n");
+    {
+        // Collect all norm weights: [attn_norm_L0, ffn_norm_L0, ..., final_norm]
+        // Total: (n_layers * 2 + 1) * hidden_dim floats stored as FP16
+        size_t total_norm_elems = (static_cast<size_t>(n_layers) * 2 + 1)
+                                 * static_cast<size_t>(hidden_dim);
+        std::vector<uint16_t> all_norms(total_norm_elems);
+        // Initialize to 1.0 (identity) in case some norms are missing
+        uint16_t one_fp16 = fp32_to_fp16(1.0f);
+        std::fill(all_norms.begin(), all_norms.end(), one_fp16);
+
+        for (int layer = 0; layer < n_layers; layer++) {
+            // Attention norm (input_layernorm)
+            std::vector<std::string> attn_norm_names = {
+                "model.layers." + std::to_string(layer) + ".input_layernorm.weight",
+                "blk." + std::to_string(layer) + ".attn_norm.weight"
+            };
+            for (const auto& name : attn_norm_names) {
+                const TensorInfo* info = impl_->reader->find_tensor(name);
+                if (!info) continue;
+                size_t offset = (static_cast<size_t>(layer) * 2)
+                              * static_cast<size_t>(hidden_dim);
+                if (info->dtype == "F16") {
+                    impl_->reader->read_tensor(*info, &all_norms[offset],
+                                              static_cast<size_t>(hidden_dim) * sizeof(uint16_t));
+                } else if (info->dtype == "F32") {
+                    std::vector<float> f32(static_cast<size_t>(hidden_dim));
+                    impl_->reader->read_tensor(*info, f32.data(),
+                                              f32.size() * sizeof(float));
+                    for (int d = 0; d < hidden_dim; d++) {
+                        all_norms[offset + static_cast<size_t>(d)] = fp32_to_fp16(f32[static_cast<size_t>(d)]);
+                    }
+                }
+                break;
+            }
+
+            // FFN norm (post_attention_layernorm)
+            std::vector<std::string> ffn_norm_names = {
+                "model.layers." + std::to_string(layer) + ".post_attention_layernorm.weight",
+                "blk." + std::to_string(layer) + ".ffn_norm.weight"
+            };
+            for (const auto& name : ffn_norm_names) {
+                const TensorInfo* info = impl_->reader->find_tensor(name);
+                if (!info) continue;
+                size_t offset = (static_cast<size_t>(layer) * 2 + 1)
+                              * static_cast<size_t>(hidden_dim);
+                if (info->dtype == "F16") {
+                    impl_->reader->read_tensor(*info, &all_norms[offset],
+                                              static_cast<size_t>(hidden_dim) * sizeof(uint16_t));
+                } else if (info->dtype == "F32") {
+                    std::vector<float> f32(static_cast<size_t>(hidden_dim));
+                    impl_->reader->read_tensor(*info, f32.data(),
+                                              f32.size() * sizeof(float));
+                    for (int d = 0; d < hidden_dim; d++) {
+                        all_norms[offset + static_cast<size_t>(d)] = fp32_to_fp16(f32[static_cast<size_t>(d)]);
+                    }
+                }
+                break;
+            }
+        }
+
+        // Final norm
+        std::vector<std::string> final_norm_names = {
+            "model.norm.weight", "output_norm.weight"
+        };
+        for (const auto& name : final_norm_names) {
+            const TensorInfo* info = impl_->reader->find_tensor(name);
+            if (!info) continue;
+            size_t offset = static_cast<size_t>(n_layers) * 2
+                          * static_cast<size_t>(hidden_dim);
+            if (info->dtype == "F16") {
+                impl_->reader->read_tensor(*info, &all_norms[offset],
+                                          static_cast<size_t>(hidden_dim) * sizeof(uint16_t));
+            } else if (info->dtype == "F32") {
+                std::vector<float> f32(static_cast<size_t>(hidden_dim));
+                impl_->reader->read_tensor(*info, f32.data(),
+                                          f32.size() * sizeof(float));
+                for (int d = 0; d < hidden_dim; d++) {
+                    all_norms[offset + static_cast<size_t>(d)] = fp32_to_fp16(f32[static_cast<size_t>(d)]);
+                }
+            }
+            break;
+        }
+
+        writer.write_expert(
+            UINT32_MAX,
+            2,  // RMSNorm weights
+            reinterpret_cast<const uint8_t*>(all_norms.data()),
+            all_norms.size() * sizeof(uint16_t),
+            nullptr, 0);
     }
 
     // --- Stage 5: Finalize ---
