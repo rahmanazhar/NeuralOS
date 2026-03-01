@@ -303,3 +303,14 @@ target_link_libraries(test_router
 )
 
 catch_discover_tests(test_router)
+
+# ── Inference Engine Tests ──────────────────────────────────────────
+add_executable(test_inference_engine test_inference_engine.cpp)
+
+target_link_libraries(test_inference_engine
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_engine
+)
+
+catch_discover_tests(test_inference_engine)
