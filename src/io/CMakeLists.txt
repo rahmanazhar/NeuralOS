@@ -2,6 +2,7 @@
 
 set(NOS_IO_SOURCES
     pread_backend.cpp
+    async_io_pool.cpp
 )
 
 # ── Linux: add io_uring backend ──────────────────────────────────────────────
@@ -13,7 +14,11 @@ add_library(nos_io STATIC ${NOS_IO_SOURCES})
 
 target_include_directories(nos_io
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+    PUBLIC ${CMAKE_SOURCE_DIR}/src
 )
+
+find_package(Threads REQUIRED)
+target_link_libraries(nos_io PUBLIC Threads::Threads)
 
 nos_set_warnings(nos_io)
 

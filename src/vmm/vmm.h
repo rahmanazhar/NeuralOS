@@ -141,6 +141,21 @@ public:
     /// KV cache size in bytes.
     size_t kv_cache_size() const;
 
+    // ── Async I/O extension (Phase 4) ──────────────────────────────────
+
+    /// Non-blocking pin: CAS EVICTED->LOADING, submit async read, return
+    /// immediately. Idempotent -- returns true if already LOADING/RESIDENT/CACHED.
+    /// Returns false only on error (e.g., allocation failure).
+    bool pin_async(ExpertHandle handle);
+
+    /// Block until page reaches RESIDENT, then pin (refcount++) and return
+    /// data pointer. Calls drain_completions() in a spin loop while LOADING.
+    const uint8_t* await_pin(ExpertHandle handle);
+
+    /// Convenience: get handle for (layer_id, expert_id) and call pin_async().
+    /// Fire-and-forget -- no error if already loaded or handle is invalid.
+    void prefetch_expert(uint32_t layer_id, uint32_t expert_id);
+
 private:
     VmmImpl* impl_;  ///< PIMPL to hide internal details
 };

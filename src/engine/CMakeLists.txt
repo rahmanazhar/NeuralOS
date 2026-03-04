@@ -8,8 +8,10 @@ add_library(nos_engine STATIC
     inference_engine.cpp
     perplexity.cpp
     sampling.cpp
+    thread_pool.cpp
 )
 
 target_include_directories(nos_engine PUBLIC ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(nos_engine PUBLIC nos_vmm nos_kernel nos_converter)
+find_package(Threads REQUIRED)
+target_link_libraries(nos_engine PUBLIC nos_vmm nos_kernel nos_converter Threads::Threads)
 nos_set_warnings(nos_engine)

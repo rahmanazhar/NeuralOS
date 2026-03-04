@@ -336,3 +336,25 @@ target_link_libraries(test_e2e_synthetic
 )
 
 catch_discover_tests(test_e2e_synthetic)
+
+# ── Thread Pool Tests ─────────────────────────────────────────
+add_executable(test_thread_pool test_thread_pool.cpp)
+
+target_link_libraries(test_thread_pool
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_engine
+)
+
+catch_discover_tests(test_thread_pool)
+
+# ── Async VMM Tests ───────────────────────────────────────────
+add_executable(test_async_vmm test_async_vmm.cpp)
+
+target_link_libraries(test_async_vmm
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_vmm
+)
+
+catch_discover_tests(test_async_vmm)

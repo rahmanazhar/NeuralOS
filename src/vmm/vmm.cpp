@@ -18,6 +18,7 @@
 #include "format/expert_format.h"
 #include "format/crc32.h"
 #include "io/platform_io.h"
+#include "io/async_io_pool.h"
 
 #include <atomic>
 #include <algorithm>
@@ -72,8 +73,14 @@ public:
     size_t kv_cache_size() const { return kv_cache_bytes_; }
     void allocate_kv_cache(size_t bytes);
 
+    // Async I/O extension (Phase 4)
+    bool pin_async(ExpertHandle handle);
+    const uint8_t* await_pin(ExpertHandle handle);
+    void prefetch_expert(uint32_t layer_id, uint32_t expert_id);
+
 private:
     void load_expert(uint32_t page_index);
+    void load_expert_async(uint32_t page_index);
     void do_evict(uint32_t page_index);
 
     VmmConfig config_;
@@ -103,6 +110,9 @@ private:
     std::atomic<uint64_t> stat_cache_misses_{0};
     std::atomic<uint64_t> stat_evictions_{0};
     std::atomic<uint64_t> stat_crc_failures_{0};
+
+    // ── Async I/O pool ────────────────────────────────────────────────────
+    std::unique_ptr<AsyncIOPool> async_io_;
 
     // ── Budget and KV cache ─────────────────────────────────────────────
     BudgetPartition budget_{};
@@ -153,6 +163,9 @@ VmmImpl::VmmImpl(VmmConfig config) : config_(std::move(config)) {
 
     // Step 4: Create PlatformIO backend
     io_ = PlatformIO::create();
+
+    // Step 4b: Create AsyncIOPool (2 I/O threads on macOS, delegates to io_uring on Linux)
+    async_io_ = std::make_unique<AsyncIOPool>(2, io_.get());
 
     // Step 5: Create slab allocator
     slot_count_ = config_.expert_cache_bytes / config_.max_expert_size;
@@ -456,6 +469,180 @@ void VmmImpl::do_evict(uint32_t page_index) {
     stat_evictions_.fetch_add(1, std::memory_order_relaxed);
 }
 
+// ── Async I/O extension ──────────────────────────────────────────────────────
+
+void VmmImpl::load_expert_async(uint32_t page_index) {
+    PageEntry& page = page_table_[page_index];
+
+    // CAS transition EVICTED -> LOADING (only one thread wins)
+    uint8_t expected = static_cast<uint8_t>(PageState::EVICTED);
+    if (!page.state.compare_exchange_strong(
+            expected, static_cast<uint8_t>(PageState::LOADING),
+            std::memory_order_acq_rel)) {
+        return;  // Another thread is already loading, or page is already loaded
+    }
+
+    // Allocate slab buffer
+    auto [buf, slot] = slab_->allocate();
+    if (!buf) {
+        // Slab full: evict to make space
+        for (size_t attempt = 0; attempt < slot_count_; ++attempt) {
+            uint32_t victim_idx = clock_pro_->evict_one();
+            if (victim_idx == UINT32_MAX) break;
+
+            PageEntry& victim = page_table_[victim_idx];
+            auto victim_state = static_cast<PageState>(
+                victim.state.load(std::memory_order_acquire));
+
+            if (victim_state == PageState::RESIDENT &&
+                victim.refcount.load(std::memory_order_acquire) == 0) {
+                do_evict(victim_idx);
+                std::tie(buf, slot) = slab_->allocate();
+                if (buf) break;
+            }
+        }
+
+        if (!buf) {
+            page.state.store(static_cast<uint8_t>(PageState::EVICTED),
+                             std::memory_order_release);
+            return;
+        }
+    }
+
+    // Store slab info so await_pin can find the data pointer
+    page.data = buf;
+    page.slab_slot = slot;
+
+    // Submit async read for weight data
+    async_io_->submit_async_read(
+        nxp_fd_, buf,
+        static_cast<size_t>(page.weight_size),
+        static_cast<off_t>(page.weight_offset),
+        [this, page_index, buf, slot](int result) {
+            PageEntry& pg = page_table_[page_index];
+
+            if (result < 0 ||
+                static_cast<uint64_t>(result) != pg.weight_size) {
+                // Read failed
+                slab_->free(slot);
+                pg.data = nullptr;
+                pg.slab_slot = -1;
+                pg.state.store(static_cast<uint8_t>(PageState::EVICTED),
+                               std::memory_order_release);
+                return;
+            }
+
+            // Read scale data synchronously (small, fast)
+            if (pg.scale_size > 0) {
+                size_t aligned_weight =
+                    (static_cast<size_t>(pg.weight_size) + 63) & ~size_t(63);
+                ssize_t sb = ::pread(nxp_fd_, buf + aligned_weight,
+                                     static_cast<size_t>(pg.scale_size),
+                                     static_cast<off_t>(pg.scale_offset));
+                (void)sb;  // Scale read failure is non-fatal
+            }
+
+            // Verify CRC32C
+            uint32_t computed_crc = crc32c(buf, static_cast<size_t>(pg.weight_size));
+            if (computed_crc != pg.crc32_expected) {
+                stat_crc_failures_.fetch_add(1, std::memory_order_relaxed);
+                slab_->free(slot);
+                pg.data = nullptr;
+                pg.slab_slot = -1;
+                pg.state.store(static_cast<uint8_t>(PageState::EVICTED),
+                               std::memory_order_release);
+                return;
+            }
+
+            // Increment load counter before state transition so that
+            // any thread observing RESIDENT via acquire also sees the counter
+            load_count_.fetch_add(1, std::memory_order_relaxed);
+
+            // Insert into CLOCK-Pro
+            clock_pro_->insert(page_index);
+
+            // Transition LOADING -> RESIDENT (release makes above visible)
+            pg.state.store(static_cast<uint8_t>(PageState::RESIDENT),
+                           std::memory_order_release);
+        });
+}
+
+bool VmmImpl::pin_async(ExpertHandle handle) {
+    if (handle.index >= total_experts_) return false;
+
+    PageEntry& page = page_table_[handle.index];
+
+    // Check current state
+    auto state = static_cast<PageState>(page.state.load(std::memory_order_acquire));
+
+    // Already loaded or loading: idempotent success
+    if (state == PageState::LOADING || state == PageState::RESIDENT ||
+        state == PageState::CACHED || state == PageState::PREFETCH) {
+        return true;
+    }
+
+    // EVICTED: initiate async load
+    if (state == PageState::EVICTED) {
+        load_expert_async(handle.index);
+        return true;
+    }
+
+    return false;
+}
+
+const uint8_t* VmmImpl::await_pin(ExpertHandle handle) {
+    if (handle.index >= total_experts_) return nullptr;
+
+    PageEntry& page = page_table_[handle.index];
+
+    // Validate generation
+    if (handle.generation != page.generation.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+
+    // Track total pins
+    stat_total_pins_.fetch_add(1, std::memory_order_relaxed);
+
+    // Spin-wait while LOADING, draining completions to progress I/O
+    auto state = static_cast<PageState>(page.state.load(std::memory_order_acquire));
+    while (state == PageState::LOADING || state == PageState::PREFETCH) {
+        async_io_->drain_completions();
+        state = static_cast<PageState>(page.state.load(std::memory_order_acquire));
+    }
+
+    if (state == PageState::EVICTED) {
+        // Not yet loaded and not loading -- fallback to synchronous load
+        stat_cache_misses_.fetch_add(1, std::memory_order_relaxed);
+        load_expert(handle.index);
+        state = static_cast<PageState>(page.state.load(std::memory_order_acquire));
+    } else if (state == PageState::RESIDENT || state == PageState::CACHED) {
+        stat_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (state == PageState::RESIDENT || state == PageState::CACHED) {
+        // Re-check generation after potential load
+        if (handle.generation != page.generation.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+
+        // Pin: increment refcount, transition to CACHED
+        page.refcount.fetch_add(1, std::memory_order_acq_rel);
+        page.state.store(static_cast<uint8_t>(PageState::CACHED),
+                         std::memory_order_release);
+
+        clock_pro_->mark_accessed(handle.index);
+        return page.data;
+    }
+
+    return nullptr;
+}
+
+void VmmImpl::prefetch_expert(uint32_t layer_id, uint32_t expert_id) {
+    ExpertHandle handle = get_handle(layer_id, expert_id);
+    if (handle == INVALID_HANDLE) return;
+    pin_async(handle);
+}
+
 // ── Vmm public interface (delegates to VmmImpl) ─────────────────────────────
 
 Vmm::Vmm(VmmConfig config) : impl_(new VmmImpl(std::move(config))) {}
@@ -516,6 +703,18 @@ void* Vmm::kv_cache_base() const {
 
 size_t Vmm::kv_cache_size() const {
     return impl_->kv_cache_size();
+}
+
+bool Vmm::pin_async(ExpertHandle handle) {
+    return impl_->pin_async(handle);
+}
+
+const uint8_t* Vmm::await_pin(ExpertHandle handle) {
+    return impl_->await_pin(handle);
+}
+
+void Vmm::prefetch_expert(uint32_t layer_id, uint32_t expert_id) {
+    impl_->prefetch_expert(layer_id, expert_id);
 }
 
 // ── Vmm::create() factory ───────────────────────────────────────────────────
