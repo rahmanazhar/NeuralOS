@@ -3,6 +3,7 @@
 
 #include "engine/inference_engine.h"
 #include "engine/rmsnorm.h"
+#include "engine/thread_pool.h"
 #include "format/expert_format.h"
 #include "kernel/bitnet_kernel.h"
 #include "kernel/packing.h"
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <fstream>
 #include <numeric>
+#include <thread>
 
 #include <nlohmann/json.hpp>
 
@@ -26,6 +28,16 @@ static constexpr uint32_t ATTN_K_ID  = 0xFFFFFFF1u;
 static constexpr uint32_t ATTN_V_ID  = 0xFFFFFFF2u;
 static constexpr uint32_t ATTN_O_ID  = 0xFFFFFFF3u;
 static constexpr uint32_t ROUTER_ID  = 0xFFFFFFFFu;
+
+// Minimum computation size to justify parallel dispatch overhead
+static constexpr int PARALLEL_THRESHOLD = 100000;
+
+struct ExpertWorkspace {
+    std::vector<float> gate_buf;
+    std::vector<float> up_buf;
+    std::vector<float> ffn_out;
+    std::vector<float> expert_out;
+};
 
 struct InferenceEngine::Impl {
     ModelConfig config;
@@ -78,6 +90,11 @@ struct InferenceEngine::Impl {
     // KV cache (from VMM)
     float* kv_cache = nullptr;
     size_t kv_cache_bytes = 0;
+
+    // Parallel expert dispatch
+    std::unique_ptr<ThreadPool> thread_pool;
+    std::vector<ExpertWorkspace> workspaces;
+    int num_threads = 0;
 
     // INT8 matmul helper
     void int8_matvec(const int8_t* weights, const uint16_t* scales,
@@ -175,7 +192,7 @@ InferenceEngine::~InferenceEngine() = default;
 int InferenceEngine::vocab_size() const { return static_cast<int>(impl_->config.vocab_size); }
 const ModelConfig& InferenceEngine::config() const { return impl_->config; }
 
-bool InferenceEngine::load(const std::string& model_dir, Vmm* vmm) {
+bool InferenceEngine::load(const std::string& model_dir, Vmm* vmm, int num_threads) {
     auto sz = [](uint32_t v) -> size_t { return static_cast<size_t>(v); };
 
     impl_->vmm = vmm;
@@ -338,6 +355,28 @@ bool InferenceEngine::load(const std::string& model_dir, Vmm* vmm) {
         }
     }
 
+    // --- Initialize thread pool for expert-parallel dispatch ---
+    int top_k_val = static_cast<int>(mc.top_k);
+    if (top_k_val > 1) {
+        int hw_threads = static_cast<int>(std::thread::hardware_concurrency());
+        if (hw_threads <= 0) hw_threads = 2;
+        impl_->num_threads = (num_threads > 0)
+            ? num_threads
+            : std::min(top_k_val, hw_threads);
+        impl_->thread_pool = std::make_unique<ThreadPool>(impl_->num_threads);
+
+        // Pre-allocate per-expert workspaces (one per top-k slot)
+        size_t expert_inter = (mc.expert_count > 0)
+            ? sz(mc.intermediate_dim / mc.expert_count) : 0;
+        impl_->workspaces.resize(static_cast<size_t>(top_k_val));
+        for (auto& ws : impl_->workspaces) {
+            ws.gate_buf.resize(expert_inter);
+            ws.up_buf.resize(expert_inter);
+            ws.ffn_out.resize(expert_inter);
+            ws.expert_out.resize(sz(mc.hidden_dim));
+        }
+    }
+
     return true;
 }
 
@@ -437,73 +476,153 @@ const float* InferenceEngine::forward_step(int token_id, int pos) {
             RouterResult route = impl_->routers[sz(L)].route(
                 impl_->norm_out.data(), top_k);
 
+            // 2j'. Next-layer prefetch: speculatively load L+1 experts
+            // during current-layer compute. Uses current norm_out as proxy
+            // for next layer's input (correlated, good enough for prefetch).
+            if (L + 1 < n_layers && impl_->vmm
+                    && !impl_->router_weights[sz(L + 1)].empty()) {
+                RouterResult next_route = impl_->routers[sz(L + 1)].route(
+                    impl_->norm_out.data(), top_k);
+                for (size_t ni = 0; ni < next_route.expert_ids.size(); ni++) {
+                    impl_->vmm->prefetch_expert(
+                        static_cast<uint32_t>(L + 1), next_route.expert_ids[ni]);
+                }
+            }
+
             // 2k. Zero MoE output
             std::memset(impl_->moe_out.data(), 0, sz(hidden_dim) * sizeof(float));
 
-            // 2l. For each selected expert
-            for (size_t ei = 0; ei < route.expert_ids.size(); ei++) {
-                uint32_t expert_id = route.expert_ids[ei];
-                float gate = route.gates[ei];
+            int expert_rows = impl_->expert_rows_per_expert;
+            int packed_cols = (hidden_dim + 4) / 5;
+            bool use_parallel = impl_->thread_pool && top_k > 1
+                && static_cast<long>(expert_rows) * hidden_dim > PARALLEL_THRESHOLD;
 
-                ExpertHandle handle = impl_->vmm->get_handle(
-                    static_cast<uint32_t>(L), expert_id);
-
-                const uint8_t* expert_data = impl_->vmm->pin(handle);
-                if (!expert_data) continue;
-
-                // Expert data layout: packed ternary weights
-                // The NxpExpertEntry has info about the expert's structure
-                // For SwiGLU: gate_proj [expert_rows x hidden_dim] and
-                //             up_proj [expert_rows x hidden_dim]
-                // packed together as [2*expert_rows x hidden_dim]
-                // Scale factors follow the packed data
-
-                // VMM slab contains packed ternary weights only.
-                // Scale factors are pre-loaded at startup.
-                int expert_rows = impl_->expert_rows_per_expert;
-                int packed_cols = (hidden_dim + 4) / 5;  // bytes per row (5-per-byte)
-
-                const uint8_t* packed_weights = expert_data;
-                const uint16_t* scale_factors =
-                    impl_->expert_scales[sz(L)][static_cast<size_t>(expert_id)].data();
-
-                // Gate projection: rows [0, expert_rows)
-                bitnet_matvec(packed_weights,
-                             impl_->norm_out.data(), impl_->gate_buf.data(),
-                             expert_rows, hidden_dim, scale_factors);
-
-                // Up projection: rows [expert_rows, 2*expert_rows)
-                const uint8_t* up_packed = packed_weights
-                    + sz(expert_rows) * sz(packed_cols);
-                const uint16_t* up_scales = scale_factors + sz(expert_rows);
-                bitnet_matvec(up_packed,
-                             impl_->norm_out.data(), impl_->up_buf.data(),
-                             expert_rows, hidden_dim, up_scales);
-
-                // SwiGLU: out[i] = SiLU(gate[i]) * up[i]
-                for (int i = 0; i < expert_rows; i++) {
-                    float g = impl_->gate_buf[sz(i)];
-                    float silu = g / (1.0f + std::exp(-g));
-                    impl_->ffn_out[sz(i)] = silu * impl_->up_buf[sz(i)];
+            if (use_parallel) {
+                // 2l. Pin all experts (may already be prefetched from previous layer)
+                struct PinnedExpert {
+                    ExpertHandle handle;
+                    const uint8_t* data;
+                };
+                std::vector<PinnedExpert> pinned(route.expert_ids.size());
+                for (size_t ei = 0; ei < route.expert_ids.size(); ei++) {
+                    pinned[ei].handle = impl_->vmm->get_handle(
+                        static_cast<uint32_t>(L), route.expert_ids[ei]);
+                    pinned[ei].data = impl_->vmm->pin(pinned[ei].handle);
                 }
 
-                // Down projection: [hidden_dim x expert_rows] -> [hidden_dim]
-                // Packed data layout: [gate(er*pc)] [up(er*pc)] [down(hd*pcd)]
-                // Scales layout: [gate(er)] [up(er)] [down(hd)]
-                const uint8_t* down_packed = packed_weights
-                    + sz(expert_rows) * 2 * sz(packed_cols);
-                const uint16_t* down_scales = scale_factors
-                    + sz(expert_rows) * 2;
+                // 2l'. Parallel dispatch: one task per expert, each writes
+                // to its own ExpertWorkspace (no sharing, no locks needed).
+                std::vector<std::function<void()>> tasks;
+                tasks.reserve(route.expert_ids.size());
+                for (size_t ei = 0; ei < route.expert_ids.size(); ei++) {
+                    if (!pinned[ei].data) continue;
+                    auto* ws = &impl_->workspaces[ei];
+                    const uint8_t* edata = pinned[ei].data;
+                    uint32_t eid = route.expert_ids[ei];
+                    const uint16_t* scales =
+                        impl_->expert_scales[sz(L)][static_cast<size_t>(eid)].data();
+                    const float* input = impl_->norm_out.data();
 
-                bitnet_matvec(down_packed,
-                             impl_->ffn_out.data(), impl_->expert_out.data(),
-                             hidden_dim, expert_rows, down_scales);
+                    tasks.push_back([ws, edata, scales, input,
+                                     expert_rows, hidden_dim, packed_cols]() {
+                        auto usz = [](int v) -> size_t {
+                            return static_cast<size_t>(v);
+                        };
+                        const uint8_t* pw = edata;
 
-                for (int d = 0; d < hidden_dim; d++) {
-                    impl_->moe_out[sz(d)] += gate * impl_->expert_out[sz(d)];
+                        // Gate projection
+                        bitnet_matvec(pw, input, ws->gate_buf.data(),
+                                     expert_rows, hidden_dim, scales);
+
+                        // Up projection
+                        const uint8_t* up_pw = pw
+                            + usz(expert_rows) * usz(packed_cols);
+                        const uint16_t* up_sc = scales + usz(expert_rows);
+                        bitnet_matvec(up_pw, input, ws->up_buf.data(),
+                                     expert_rows, hidden_dim, up_sc);
+
+                        // SwiGLU activation
+                        for (int i = 0; i < expert_rows; i++) {
+                            float g = ws->gate_buf[usz(i)];
+                            float silu = g / (1.0f + std::exp(-g));
+                            ws->ffn_out[usz(i)] = silu * ws->up_buf[usz(i)];
+                        }
+
+                        // Down projection
+                        const uint8_t* down_pw = pw
+                            + usz(expert_rows) * 2 * usz(packed_cols);
+                        const uint16_t* down_sc = scales
+                            + usz(expert_rows) * 2;
+                        bitnet_matvec(down_pw, ws->ffn_out.data(),
+                                     ws->expert_out.data(),
+                                     hidden_dim, expert_rows, down_sc);
+                    });
                 }
 
-                impl_->vmm->unpin(handle);
+                std::span<std::function<void()>> task_span(tasks);
+                impl_->thread_pool->dispatch_batch(task_span);
+
+                // 2l''. Combine gated results (single-threaded, after barrier)
+                for (size_t ei = 0; ei < route.expert_ids.size(); ei++) {
+                    if (!pinned[ei].data) continue;
+                    float gate = route.gates[ei];
+                    const auto& ws = impl_->workspaces[ei];
+                    for (int d = 0; d < hidden_dim; d++) {
+                        impl_->moe_out[sz(d)] += gate * ws.expert_out[sz(d)];
+                    }
+                }
+
+                // 2l'''. Unpin all experts
+                for (auto& pe : pinned) {
+                    if (pe.data) impl_->vmm->unpin(pe.handle);
+                }
+            } else {
+                // Sequential fallback (top_k=1, small model, or no pool)
+                for (size_t ei = 0; ei < route.expert_ids.size(); ei++) {
+                    uint32_t expert_id = route.expert_ids[ei];
+                    float gate = route.gates[ei];
+
+                    ExpertHandle handle = impl_->vmm->get_handle(
+                        static_cast<uint32_t>(L), expert_id);
+
+                    const uint8_t* expert_data = impl_->vmm->pin(handle);
+                    if (!expert_data) continue;
+
+                    const uint8_t* packed_weights = expert_data;
+                    const uint16_t* scale_factors =
+                        impl_->expert_scales[sz(L)][static_cast<size_t>(expert_id)].data();
+
+                    bitnet_matvec(packed_weights,
+                                 impl_->norm_out.data(), impl_->gate_buf.data(),
+                                 expert_rows, hidden_dim, scale_factors);
+
+                    const uint8_t* up_packed = packed_weights
+                        + sz(expert_rows) * sz(packed_cols);
+                    const uint16_t* up_scales = scale_factors + sz(expert_rows);
+                    bitnet_matvec(up_packed,
+                                 impl_->norm_out.data(), impl_->up_buf.data(),
+                                 expert_rows, hidden_dim, up_scales);
+
+                    for (int i = 0; i < expert_rows; i++) {
+                        float g = impl_->gate_buf[sz(i)];
+                        float silu = g / (1.0f + std::exp(-g));
+                        impl_->ffn_out[sz(i)] = silu * impl_->up_buf[sz(i)];
+                    }
+
+                    const uint8_t* down_packed = packed_weights
+                        + sz(expert_rows) * 2 * sz(packed_cols);
+                    const uint16_t* down_scales = scale_factors
+                        + sz(expert_rows) * 2;
+                    bitnet_matvec(down_packed,
+                                 impl_->ffn_out.data(), impl_->expert_out.data(),
+                                 hidden_dim, expert_rows, down_scales);
+
+                    for (int d = 0; d < hidden_dim; d++) {
+                        impl_->moe_out[sz(d)] += gate * impl_->expert_out[sz(d)];
+                    }
+
+                    impl_->vmm->unpin(handle);
+                }
             }
 
             // 2m. Residual + MoE output

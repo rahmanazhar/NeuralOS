@@ -31,9 +31,10 @@ public:
 
     /// Load model from converted .nxp directory.
     /// Reads model_config.json via nos::from_json() into nos::ModelConfig.
-    /// @param model_dir Directory containing model.nxp and model_config.json
-    /// @param vmm       VMM instance for expert paging (non-owning)
-    bool load(const std::string& model_dir, Vmm* vmm);
+    /// @param model_dir    Directory containing model.nxp and model_config.json
+    /// @param vmm          VMM instance for expert paging (non-owning)
+    /// @param num_threads  Thread count for expert-parallel dispatch (0 = auto)
+    bool load(const std::string& model_dir, Vmm* vmm, int num_threads = 0);
 
     /// Forward pass for a single token at position pos.
     /// Returns pointer to logits buffer (vocab_size floats).
