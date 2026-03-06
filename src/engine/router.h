@@ -12,6 +12,7 @@ namespace nos {
 struct RouterResult {
     std::vector<uint32_t> expert_ids;  ///< k selected expert indices
     std::vector<float> gates;          ///< k gating weights (sum to 1.0)
+    std::vector<float> raw_scores;     ///< All expert dot-product scores (before top-k/softmax)
 };
 
 /// Top-k expert router for MoE layers.

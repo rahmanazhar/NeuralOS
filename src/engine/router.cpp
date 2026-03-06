@@ -32,6 +32,7 @@ RouterResult Router::route(const float* hidden_state, int k) const {
     RouterResult result;
     result.expert_ids.resize(sz(k));
     result.gates.resize(sz(k));
+    result.raw_scores = scores;
 
     float max_score = scores[indices[0]];
     float sum_exp = 0.0f;

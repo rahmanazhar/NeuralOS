@@ -44,12 +44,17 @@ public:
     int n_kv_heads() const { return n_kv_heads_; }
     int head_dim() const { return head_dim_; }
 
+    /// Average Shannon entropy across all attention heads from last forward().
+    float last_entropy() const { return last_entropy_; }
+
 private:
     int n_heads_ = 0;
     int n_kv_heads_ = 0;
     int head_dim_ = 0;
     int max_seq_len_ = 0;
     int kv_groups_ = 0;  // n_heads / n_kv_heads
+
+    float last_entropy_ = 0.0f;
 
     // Workspace for attention scores (allocated once)
     std::vector<float> score_buf_;

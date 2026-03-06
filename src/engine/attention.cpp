@@ -43,6 +43,7 @@ void Attention::forward(float* output, const float* q, const float* k, const flo
     }
 
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim_));
+    float entropy_sum = 0.0f;
 
     for (int qh = 0; qh < n_heads_; qh++) {
         const float* q_head = q + sz(qh) * sz(head_dim_);
@@ -72,6 +73,16 @@ void Attention::forward(float* output, const float* q, const float* k, const flo
             score_buf_[sz(t)] *= inv_sum;
         }
 
+        // Accumulate Shannon entropy for this head: -sum(p * log(p))
+        float head_entropy = 0.0f;
+        for (int t = 0; t <= pos; t++) {
+            float p = score_buf_[sz(t)];
+            if (p > 1e-10f) {
+                head_entropy -= p * std::log(p);
+            }
+        }
+        entropy_sum += head_entropy;
+
         float* out_head = output + sz(qh) * sz(head_dim_);
         std::memset(out_head, 0, sz(head_dim_) * sizeof(float));
         for (int t = 0; t <= pos; t++) {
@@ -82,6 +93,8 @@ void Attention::forward(float* output, const float* q, const float* k, const flo
             }
         }
     }
+
+    last_entropy_ = (n_heads_ > 0) ? entropy_sum / static_cast<float>(n_heads_) : 0.0f;
 }
 
 }  // namespace nos

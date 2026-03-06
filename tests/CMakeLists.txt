@@ -358,3 +358,14 @@ target_link_libraries(test_async_vmm
 )
 
 catch_discover_tests(test_async_vmm)
+
+# ── Shift Detector Tests ────────────────────────────────────────
+add_executable(test_shift_detector test_shift_detector.cpp)
+
+target_link_libraries(test_shift_detector
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_engine
+)
+
+catch_discover_tests(test_shift_detector)
