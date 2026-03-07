@@ -11,6 +11,7 @@
 #include "engine/attention.h"
 #include "engine/rope.h"
 #include "engine/router.h"
+#include "engine/sticky_router.h"
 
 #include <cstdint>
 #include <memory>
@@ -45,6 +46,12 @@ public:
 
     int vocab_size() const;
     const ModelConfig& config() const;
+
+    /// Aggregate sticky routing metrics.
+    StickyRouter::AggregateMetrics routing_metrics() const;
+
+    /// Last per-layer routing trace (for --trace-routing).
+    const StickyRouter::TraceEntry& last_routing_trace() const;
 
 private:
     struct Impl;

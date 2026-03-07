@@ -10,6 +10,7 @@ add_library(nos_engine STATIC
     sampling.cpp
     thread_pool.cpp
     shift_detector.cpp
+    sticky_router.cpp
 )
 
 target_include_directories(nos_engine PUBLIC ${CMAKE_SOURCE_DIR}/src)

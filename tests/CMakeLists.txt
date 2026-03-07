@@ -369,3 +369,14 @@ target_link_libraries(test_shift_detector
 )
 
 catch_discover_tests(test_shift_detector)
+
+# ── Sticky Router Tests ─────────────────────────────────────────
+add_executable(test_sticky_router test_sticky_router.cpp)
+
+target_link_libraries(test_sticky_router
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_engine
+)
+
+catch_discover_tests(test_sticky_router)

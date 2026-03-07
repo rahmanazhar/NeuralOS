@@ -3,6 +3,8 @@
 
 #include "engine/inference_engine.h"
 #include "engine/rmsnorm.h"
+#include "engine/shift_detector.h"
+#include "engine/sticky_router.h"
 #include "engine/thread_pool.h"
 #include "format/expert_format.h"
 #include "kernel/bitnet_kernel.h"
@@ -95,6 +97,11 @@ struct InferenceEngine::Impl {
     std::unique_ptr<ThreadPool> thread_pool;
     std::vector<ExpertWorkspace> workspaces;
     int num_threads = 0;
+
+    // Sticky routing and shift detection
+    StickyRouter sticky_router;
+    ShiftDetector shift_detector;
+    std::vector<float> prev_hidden_state;
 
     // INT8 matmul helper
     void int8_matvec(const int8_t* weights, const uint16_t* scales,
@@ -190,6 +197,14 @@ InferenceEngine::InferenceEngine() : impl_(std::make_unique<Impl>()) {}
 InferenceEngine::~InferenceEngine() = default;
 
 int InferenceEngine::vocab_size() const { return static_cast<int>(impl_->config.vocab_size); }
+
+StickyRouter::AggregateMetrics InferenceEngine::routing_metrics() const {
+    return impl_->sticky_router.aggregate_metrics();
+}
+
+const StickyRouter::TraceEntry& InferenceEngine::last_routing_trace() const {
+    return impl_->sticky_router.last_trace();
+}
 const ModelConfig& InferenceEngine::config() const { return impl_->config; }
 
 bool InferenceEngine::load(const std::string& model_dir, Vmm* vmm, int num_threads) {
@@ -377,6 +392,10 @@ bool InferenceEngine::load(const std::string& model_dir, Vmm* vmm, int num_threa
         }
     }
 
+    // --- Initialize sticky routing and shift detection ---
+    impl_->sticky_router.init(static_cast<int>(mc.n_layers));
+    impl_->prev_hidden_state.resize(sz(mc.hidden_dim), 0.0f);
+
     return true;
 }
 
@@ -384,6 +403,9 @@ void InferenceEngine::reset_kv_cache() {
     if (impl_->kv_cache && impl_->kv_cache_bytes > 0) {
         std::memset(impl_->kv_cache, 0, impl_->kv_cache_bytes);
     }
+    impl_->sticky_router.reset();
+    impl_->shift_detector.reset();
+    std::fill(impl_->prev_hidden_state.begin(), impl_->prev_hidden_state.end(), 0.0f);
 }
 
 const float* InferenceEngine::forward_step(int token_id, int pos) {
@@ -471,10 +493,40 @@ const float* InferenceEngine::forward_step(int token_id, int pos) {
         rmsnorm(impl_->norm_out.data(), impl_->hidden_state.data(),
                 impl_->norm_weights.data() + ffn_norm_idx, hidden_dim, eps);
 
-        // 2j. MoE routing
+        // 2j. MoE routing with sticky routing and shift detection
         if (mc.expert_count > 0 && !impl_->router_weights[sz(L)].empty()) {
-            RouterResult route = impl_->routers[sz(L)].route(
+            // Compute shift detection signals
+            float attn_entropy = impl_->attention.last_entropy();
+            float cos_sim = cosine_similarity(
+                impl_->hidden_state.data(), impl_->prev_hidden_state.data(),
+                hidden_dim);
+
+            // Get base router result (includes raw_scores for variance)
+            RouterResult base_route = impl_->routers[sz(L)].route(
                 impl_->norm_out.data(), top_k);
+
+            // Compute router logit variance from raw_scores
+            float logit_var = 0.0f;
+            if (!base_route.raw_scores.empty()) {
+                float mean = 0.0f;
+                for (float s : base_route.raw_scores) mean += s;
+                mean /= static_cast<float>(base_route.raw_scores.size());
+                float sq_sum = 0.0f;
+                for (float s : base_route.raw_scores) {
+                    float d = s - mean;
+                    sq_sum += d * d;
+                }
+                logit_var = sq_sum / static_cast<float>(base_route.raw_scores.size());
+            }
+
+            // Evaluate shift detector
+            auto shift = impl_->shift_detector.evaluate(
+                attn_entropy, cos_sim, logit_var);
+
+            // Route via sticky router (wraps base router with stickiness)
+            RouterResult route = impl_->sticky_router.route(
+                impl_->routers[sz(L)], impl_->norm_out.data(), top_k,
+                static_cast<uint32_t>(L), pos, shift.detected);
 
             // 2j'. Next-layer prefetch: speculatively load L+1 experts
             // during current-layer compute. Uses current norm_out as proxy
@@ -636,6 +688,18 @@ const float* InferenceEngine::forward_step(int token_id, int pos) {
                         sz(hidden_dim) * sizeof(float));
         }
     }
+
+    // 2n. Per-token sticky routing feedback
+    if (impl_->vmm) {
+        VmmStats vs = impl_->vmm->stats();
+        float miss_rate = (vs.total_pins > 0)
+            ? static_cast<float>(vs.cache_misses) / static_cast<float>(vs.total_pins)
+            : 0.0f;
+        impl_->sticky_router.update_io_pressure(miss_rate);
+    }
+    // Store current hidden state for next token's cosine similarity
+    std::memcpy(impl_->prev_hidden_state.data(), impl_->hidden_state.data(),
+                sz(hidden_dim) * sizeof(float));
 
     // 3. Final RMSNorm
     size_t final_norm_idx = sz(n_layers) * 2 * sz(hidden_dim);
