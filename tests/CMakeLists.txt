@@ -380,3 +380,25 @@ target_link_libraries(test_sticky_router
 )
 
 catch_discover_tests(test_sticky_router)
+
+# ── Metrics Tests ──────────────────────────────────────────────
+add_executable(test_metrics test_metrics.cpp)
+
+target_link_libraries(test_metrics
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_engine
+)
+
+catch_discover_tests(test_metrics)
+
+# ── Benchmark Output Tests ─────────────────────────────────────
+add_executable(test_benchmark_output test_benchmark_output.cpp)
+
+target_link_libraries(test_benchmark_output
+    PRIVATE
+        Catch2::Catch2WithMain
+        nos_engine
+)
+
+catch_discover_tests(test_benchmark_output)

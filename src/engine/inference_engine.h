@@ -9,6 +9,7 @@
 
 #include "converter/model_config.h"
 #include "engine/attention.h"
+#include "engine/metrics.h"
 #include "engine/rope.h"
 #include "engine/router.h"
 #include "engine/sticky_router.h"
@@ -52,6 +53,12 @@ public:
 
     /// Last per-layer routing trace (for --trace-routing).
     const StickyRouter::TraceEntry& last_routing_trace() const;
+
+    /// Metrics collector (always-on, lock-free atomic counters).
+    const MetricsCollector& metrics() const;
+
+    /// Time-to-first-token in milliseconds (0 if not yet recorded).
+    double ttft_ms() const;
 
 private:
     struct Impl;

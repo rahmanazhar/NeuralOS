@@ -2,6 +2,7 @@
 /// @brief Full transformer forward pass implementation.
 
 #include "engine/inference_engine.h"
+#include "engine/metrics.h"
 #include "engine/rmsnorm.h"
 #include "engine/shift_detector.h"
 #include "engine/sticky_router.h"
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -102,6 +104,13 @@ struct InferenceEngine::Impl {
     StickyRouter sticky_router;
     ShiftDetector shift_detector;
     std::vector<float> prev_hidden_state;
+
+    // Metrics and TTFT tracking
+    MetricsCollector metrics_collector;
+    std::chrono::high_resolution_clock::time_point inference_start;
+    double ttft_ms = 0.0;
+    bool ttft_recorded = false;
+    int token_count = 0;
 
     // INT8 matmul helper
     void int8_matvec(const int8_t* weights, const uint16_t* scales,
@@ -206,6 +215,12 @@ const StickyRouter::TraceEntry& InferenceEngine::last_routing_trace() const {
     return impl_->sticky_router.last_trace();
 }
 const ModelConfig& InferenceEngine::config() const { return impl_->config; }
+
+const MetricsCollector& InferenceEngine::metrics() const {
+    return impl_->metrics_collector;
+}
+
+double InferenceEngine::ttft_ms() const { return impl_->ttft_ms; }
 
 bool InferenceEngine::load(const std::string& model_dir, Vmm* vmm, int num_threads) {
     auto sz = [](uint32_t v) -> size_t { return static_cast<size_t>(v); };
@@ -396,6 +411,10 @@ bool InferenceEngine::load(const std::string& model_dir, Vmm* vmm, int num_threa
     impl_->sticky_router.init(static_cast<int>(mc.n_layers));
     impl_->prev_hidden_state.resize(sz(mc.hidden_dim), 0.0f);
 
+    // --- Initialize metrics ---
+    impl_->metrics_collector.register_defaults();
+    impl_->inference_start = std::chrono::high_resolution_clock::now();
+
     return true;
 }
 
@@ -406,9 +425,17 @@ void InferenceEngine::reset_kv_cache() {
     impl_->sticky_router.reset();
     impl_->shift_detector.reset();
     std::fill(impl_->prev_hidden_state.begin(), impl_->prev_hidden_state.end(), 0.0f);
+    impl_->metrics_collector.reset();
+    impl_->metrics_collector.register_defaults();
+    impl_->ttft_ms = 0.0;
+    impl_->ttft_recorded = false;
+    impl_->token_count = 0;
+    impl_->inference_start = std::chrono::high_resolution_clock::now();
 }
 
 const float* InferenceEngine::forward_step(int token_id, int pos) {
+    auto t_step_start = std::chrono::high_resolution_clock::now();
+
     auto sz = [](int v) -> size_t { return static_cast<size_t>(v); };
     auto& mc = impl_->config;
     int hidden_dim = static_cast<int>(mc.hidden_dim);
@@ -523,10 +550,21 @@ const float* InferenceEngine::forward_step(int token_id, int pos) {
             auto shift = impl_->shift_detector.evaluate(
                 attn_entropy, cos_sim, logit_var);
 
+            // Track shift detection
+            if (shift.detected) {
+                impl_->metrics_collector.inc_counter("shift_detections");
+            }
+
             // Route via sticky router (wraps base router with stickiness)
             RouterResult route = impl_->sticky_router.route(
                 impl_->routers[sz(L)], impl_->norm_out.data(), top_k,
                 static_cast<uint32_t>(L), pos, shift.detected);
+
+            // Track routing decisions
+            impl_->metrics_collector.inc_counter("total_routing_decisions");
+            if (impl_->sticky_router.last_trace().switched) {
+                impl_->metrics_collector.inc_counter("expert_switches");
+            }
 
             // 2j'. Next-layer prefetch: speculatively load L+1 experts
             // during current-layer compute. Uses current norm_out as proxy
@@ -710,6 +748,35 @@ const float* InferenceEngine::forward_step(int token_id, int pos) {
     impl_->fp16_matvec(impl_->output_proj.data(), impl_->norm_out.data(),
                        impl_->logits.data(),
                        static_cast<int>(mc.vocab_size), hidden_dim);
+
+    // --- Metrics instrumentation ---
+    impl_->token_count++;
+    impl_->metrics_collector.inc_counter("tokens_generated");
+
+    // Per-token latency
+    auto t_step_end = std::chrono::high_resolution_clock::now();
+    double step_ms = std::chrono::duration<double, std::milli>(
+        t_step_end - t_step_start).count();
+    impl_->metrics_collector.observe_histogram("token_latency_ms", step_ms);
+
+    // TTFT: record time of first token
+    if (!impl_->ttft_recorded) {
+        impl_->ttft_ms = std::chrono::duration<double, std::milli>(
+            t_step_end - impl_->inference_start).count();
+        impl_->ttft_recorded = true;
+    }
+
+    // Periodic timeline recording (every 10 tokens)
+    if (impl_->token_count % 10 == 0 && impl_->vmm) {
+        double ts = std::chrono::duration<double>(
+            t_step_end - impl_->inference_start).count();
+        VmmStats vs = impl_->vmm->stats();
+        float miss_rate = (vs.total_pins > 0)
+            ? static_cast<float>(vs.cache_misses) / static_cast<float>(vs.total_pins)
+            : 0.0f;
+        impl_->metrics_collector.record_timeline(
+            "io_pressure", ts, static_cast<double>(miss_rate));
+    }
 
     return impl_->logits.data();
 }

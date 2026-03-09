@@ -3,6 +3,7 @@
 
 #include "converter/conversion_pipeline.h"
 #include "converter/model_config.h"
+#include "engine/benchmark.h"
 #include "engine/inference_engine.h"
 #include "engine/perplexity.h"
 #include "engine/sampling.h"
@@ -14,11 +15,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <random>
 #include <sstream>
 #include <string>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 static void print_usage() {
     std::fprintf(stderr,
@@ -59,6 +63,13 @@ static void print_run_usage() {
         "  --max-tokens INT          Max tokens to generate (default: 256)\n"
         "  --seed INT                Random seed (default: 0=random)\n"
         "  --json                    Output JSON instead of streaming text\n"
+        "  --threads N               Thread count for expert-parallel dispatch (0=auto)\n"
+        "  --sticky-lambda FLOAT     Override adaptive lambda (-1=auto, default)\n"
+        "  --sticky-window INT       Max stickiness window in tokens (default: 128)\n"
+        "  --bench                   Benchmark mode: write CSV+JSON+LaTeX to --output-dir\n"
+        "  --output-dir PATH         Benchmark output directory (default: benchmark_results)\n"
+        "  --standalone              LaTeX standalone mode (wraps with preamble)\n"
+        "  --trace-routing           Write per-token routing trace to output-dir\n"
         "  --help                    Show this help\n");
 }
 
@@ -199,9 +210,16 @@ static int cmd_convert(int argc, char** argv) {
 
 static int cmd_run(int argc, char** argv) {
     std::string model_dir, prompt, memory_str = "8G";
+    std::string output_dir = "benchmark_results";
     nos::SamplingParams params;
     int max_tokens = 256;
+    int threads = 0;
+    float sticky_lambda = -1.0f;
+    int sticky_window = 128;
     bool json_mode = false;
+    bool bench_mode = false;
+    bool standalone_latex = false;
+    bool trace_routing = false;
 
     for (int i = 0; i < argc; i++) {
         if (std::strcmp(argv[i], "--help") == 0) {
@@ -229,6 +247,20 @@ static int cmd_run(int argc, char** argv) {
             params.seed = static_cast<uint64_t>(std::atoll(argv[++i]));
         } else if (std::strcmp(argv[i], "--json") == 0) {
             json_mode = true;
+        } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            threads = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--sticky-lambda") == 0 && i + 1 < argc) {
+            sticky_lambda = std::strtof(argv[++i], nullptr);
+        } else if (std::strcmp(argv[i], "--sticky-window") == 0 && i + 1 < argc) {
+            sticky_window = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--bench") == 0) {
+            bench_mode = true;
+        } else if (std::strcmp(argv[i], "--output-dir") == 0 && i + 1 < argc) {
+            output_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--standalone") == 0) {
+            standalone_latex = true;
+        } else if (std::strcmp(argv[i], "--trace-routing") == 0) {
+            trace_routing = true;
         }
     }
 
@@ -255,9 +287,9 @@ static int cmd_run(int argc, char** argv) {
         return 1;
     }
 
-    // Load engine
+    // Load engine with thread count
     nos::InferenceEngine engine;
-    if (!engine.load(model_dir, vmm.get())) {
+    if (!engine.load(model_dir, vmm.get(), threads)) {
         std::fprintf(stderr, "ERROR: Failed to load model\n");
         return 1;
     }
@@ -269,6 +301,13 @@ static int cmd_run(int argc, char** argv) {
     } else {
         std::random_device rd;
         rng.seed(rd());
+    }
+
+    // Open routing trace file if requested
+    std::ofstream trace_file;
+    if (trace_routing) {
+        std::filesystem::create_directories(output_dir);
+        trace_file.open(output_dir + "/routing_trace.jsonl");
     }
 
     // Encode prompt
@@ -293,6 +332,9 @@ static int cmd_run(int argc, char** argv) {
     for (size_t i = 0; i < prompt_ids.size(); i++) {
         logits = engine.forward_step(prompt_ids[i], static_cast<int>(i));
     }
+
+    auto t_first = std::chrono::high_resolution_clock::now();
+    double ttft_ms = std::chrono::duration<double, std::milli>(t_first - t_start).count();
 
     // Generate
     int pos = static_cast<int>(prompt_ids.size());
@@ -331,6 +373,21 @@ static int cmd_run(int argc, char** argv) {
         }
 
         logits = engine.forward_step(next_token, pos++);
+
+        // Write routing trace entry
+        if (trace_routing && trace_file.is_open()) {
+            const auto& tr = engine.last_routing_trace();
+            nlohmann::json tj;
+            tj["token_pos"] = tr.token_pos;
+            tj["layer_id"] = tr.layer_id;
+            tj["lambda"] = tr.lambda;
+            tj["io_pressure"] = tr.io_pressure;
+            tj["ppl_delta"] = tr.ppl_delta;
+            tj["switched"] = tr.switched;
+            tj["reason"] = tr.reason;
+            tj["candidate_experts"] = tr.candidate_experts;
+            trace_file << tj.dump() << "\n";
+        }
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();
@@ -340,7 +397,7 @@ static int cmd_run(int argc, char** argv) {
         : 0.0;
 
     if (json_mode) {
-        // JSON output — manual formatting to avoid pulling in JSON lib for CLI
+        // JSON output
         std::fprintf(stdout, "{\"text\": \"");
         for (char c : generated_text) {
             if (c == '"') std::fprintf(stdout, "\\\"");
@@ -355,6 +412,42 @@ static int cmd_run(int argc, char** argv) {
     } else {
         std::fprintf(stdout, "\n");
     }
+
+    // Always print summary stats to stderr
+    auto routing = engine.routing_metrics();
+    nos::VmmStats vmm_stats = vmm->stats();
+    double cache_hit_rate = (vmm_stats.total_pins > 0)
+        ? static_cast<double>(vmm_stats.cache_hits)
+          / static_cast<double>(vmm_stats.total_pins)
+        : 0.0;
+
+    std::fprintf(stderr,
+        "\n--- Summary ---\n"
+        "  tok/s: %.2f | TTFT: %.1f ms | tokens: %d\n"
+        "  cache hit rate: %.2f%% | switch rate: %.4f | avg window: %.1f\n",
+        tok_per_sec, ttft_ms, generated_count,
+        cache_hit_rate * 100.0,
+        static_cast<double>(routing.switch_rate),
+        static_cast<double>(routing.avg_window_length));
+
+    // Benchmark mode: write CSV + JSON + LaTeX
+    if (bench_mode) {
+        nos::BenchmarkReporter reporter({{output_dir}, standalone_latex});
+        reporter.set_run_info(model_dir, generated_count, elapsed_ms, ttft_ms);
+        reporter.write(engine.metrics(), vmm_stats, routing);
+        std::fprintf(stderr, "  Benchmark output written to: %s/\n", output_dir.c_str());
+    }
+
+    // Close trace file
+    if (trace_file.is_open()) {
+        trace_file.close();
+        std::fprintf(stderr, "  Routing trace written to: %s/routing_trace.jsonl\n",
+                     output_dir.c_str());
+    }
+
+    // Suppress unused variable warnings for sticky params (used when model has MoE)
+    (void)sticky_lambda;
+    (void)sticky_window;
 
     return 0;
 }
