@@ -60,6 +60,9 @@ public:
     /// Time-to-first-token in milliseconds (0 if not yet recorded).
     double ttft_ms() const;
 
+    /// Configure sticky routing parameters. Call before load().
+    void set_sticky_config(float lambda_override, int max_window);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

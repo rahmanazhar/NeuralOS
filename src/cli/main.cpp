@@ -289,6 +289,7 @@ static int cmd_run(int argc, char** argv) {
 
     // Load engine with thread count
     nos::InferenceEngine engine;
+    engine.set_sticky_config(sticky_lambda, sticky_window);
     if (!engine.load(model_dir, vmm.get(), threads)) {
         std::fprintf(stderr, "ERROR: Failed to load model\n");
         return 1;
@@ -444,10 +445,6 @@ static int cmd_run(int argc, char** argv) {
         std::fprintf(stderr, "  Routing trace written to: %s/routing_trace.jsonl\n",
                      output_dir.c_str());
     }
-
-    // Suppress unused variable warnings for sticky params (used when model has MoE)
-    (void)sticky_lambda;
-    (void)sticky_window;
 
     return 0;
 }

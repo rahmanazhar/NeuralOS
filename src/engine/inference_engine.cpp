@@ -222,6 +222,13 @@ const MetricsCollector& InferenceEngine::metrics() const {
 
 double InferenceEngine::ttft_ms() const { return impl_->ttft_ms; }
 
+void InferenceEngine::set_sticky_config(float lambda_override, int max_window) {
+    StickyRouter::Config cfg = impl_->sticky_router.config();
+    cfg.lambda_override = lambda_override;
+    cfg.max_window = max_window;
+    impl_->sticky_router = StickyRouter(cfg);
+}
+
 bool InferenceEngine::load(const std::string& model_dir, Vmm* vmm, int num_threads) {
     auto sz = [](uint32_t v) -> size_t { return static_cast<size_t>(v); };
 
@@ -594,11 +601,24 @@ const float* InferenceEngine::forward_step(int token_id, int pos) {
                     const uint8_t* data;
                 };
                 std::vector<PinnedExpert> pinned(route.expert_ids.size());
+                auto io_before = impl_->vmm->stats();
                 for (size_t ei = 0; ei < route.expert_ids.size(); ei++) {
+                    auto t_pin_start = std::chrono::high_resolution_clock::now();
                     pinned[ei].handle = impl_->vmm->get_handle(
                         static_cast<uint32_t>(L), route.expert_ids[ei]);
                     pinned[ei].data = impl_->vmm->pin(pinned[ei].handle);
+                    auto t_pin_end = std::chrono::high_resolution_clock::now();
+                    double pin_us = std::chrono::duration<double, std::micro>(
+                        t_pin_end - t_pin_start).count();
+                    impl_->metrics_collector.observe_histogram("io_latency_us", pin_us);
                 }
+                auto io_after = impl_->vmm->stats();
+                uint64_t batch_hits = io_after.cache_hits - io_before.cache_hits;
+                uint64_t batch_misses = io_after.cache_misses - io_before.cache_misses;
+                impl_->metrics_collector.inc_counter("cache_hits", batch_hits);
+                impl_->metrics_collector.inc_counter("cache_misses", batch_misses);
+                impl_->metrics_collector.inc_counter("expert_loads", batch_misses);
+                impl_->metrics_collector.inc_counter("expert_reuses", batch_hits);
 
                 // 2l'. Parallel dispatch: one task per expert, each writes
                 // to its own ExpertWorkspace (no sharing, no locks needed).
@@ -672,10 +692,25 @@ const float* InferenceEngine::forward_step(int token_id, int pos) {
                     uint32_t expert_id = route.expert_ids[ei];
                     float gate = route.gates[ei];
 
+                    auto seq_io_before = impl_->vmm->stats();
+                    auto t_pin_start = std::chrono::high_resolution_clock::now();
                     ExpertHandle handle = impl_->vmm->get_handle(
                         static_cast<uint32_t>(L), expert_id);
 
                     const uint8_t* expert_data = impl_->vmm->pin(handle);
+                    auto t_pin_end = std::chrono::high_resolution_clock::now();
+                    double pin_us = std::chrono::duration<double, std::micro>(
+                        t_pin_end - t_pin_start).count();
+                    impl_->metrics_collector.observe_histogram("io_latency_us", pin_us);
+
+                    auto seq_io_after = impl_->vmm->stats();
+                    if (seq_io_after.cache_hits > seq_io_before.cache_hits) {
+                        impl_->metrics_collector.inc_counter("cache_hits");
+                        impl_->metrics_collector.inc_counter("expert_reuses");
+                    } else if (seq_io_after.cache_misses > seq_io_before.cache_misses) {
+                        impl_->metrics_collector.inc_counter("cache_misses");
+                        impl_->metrics_collector.inc_counter("expert_loads");
+                    }
                     if (!expert_data) continue;
 
                     const uint8_t* packed_weights = expert_data;
@@ -776,6 +811,12 @@ const float* InferenceEngine::forward_step(int token_id, int pos) {
             : 0.0f;
         impl_->metrics_collector.record_timeline(
             "io_pressure", ts, static_cast<double>(miss_rate));
+        // Memory utilization: resident pages as fraction of total capacity
+        double resident_ratio = (vs.total_pins > 0)
+            ? static_cast<double>(vs.cache_hits) / static_cast<double>(vs.total_pins)
+            : 0.0;
+        impl_->metrics_collector.record_timeline(
+            "memory_utilization", ts, resident_ratio);
     }
 
     return impl_->logits.data();
