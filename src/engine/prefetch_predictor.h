@@ -74,7 +74,8 @@ private:
     std::vector<
         std::unordered_map<ExpertId,
             std::unordered_map<ExpertId, uint32_t>>> tables_;
-    std::vector<ExpertId> last_chosen_;  // last representative expert per layer
+    std::vector<ExpertId> last_chosen_;   // last observed representative expert per layer
+    std::vector<ExpertId> predict_from_;  // source of the most recent transition (for predict)
 };
 
 // ── RepeatLastPredictor ───────────────────────────────────────────────────────

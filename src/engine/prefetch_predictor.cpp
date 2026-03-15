@@ -146,13 +146,14 @@ int NGramPredictor::gram_size() const {
 
 MarkovPredictor::MarkovPredictor(int n_layers)
     : tables_(static_cast<std::size_t>(n_layers)),
-      last_chosen_(static_cast<std::size_t>(n_layers), static_cast<ExpertId>(0)) {}
+      last_chosen_(static_cast<std::size_t>(n_layers), static_cast<ExpertId>(0)),
+      predict_from_(static_cast<std::size_t>(n_layers), static_cast<ExpertId>(0)) {}
 
 void MarkovPredictor::observe(int layer, const std::vector<ExpertId>& chosen) {
     if (chosen.empty()) {
         return;
     }
-    std::size_t idx = static_cast<std::size_t>(layer);
+    std::size_t idx  = static_cast<std::size_t>(layer);
     ExpertId    prev = last_chosen_[idx];
 
     // Record transition from prev to each chosen expert
@@ -160,13 +161,17 @@ void MarkovPredictor::observe(int layer, const std::vector<ExpertId>& chosen) {
         tables_[idx][prev][expert]++;
     }
 
+    // Track the source of this transition for prediction
+    predict_from_[idx] = prev;
+
     // Update last representative as the first expert in chosen
     last_chosen_[idx] = chosen[0];
 }
 
 std::vector<ExpertId> MarkovPredictor::predict(int layer, int top_k) const {
     std::size_t idx  = static_cast<std::size_t>(layer);
-    ExpertId    last = last_chosen_[idx];
+    // Predict what follows the source of the most recent observed transition
+    ExpertId    last = predict_from_[idx];
 
     auto layer_it = tables_[idx].find(last);
     if (layer_it == tables_[idx].end()) {
