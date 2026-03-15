@@ -3,6 +3,8 @@
 
 #include "engine/benchmark.h"
 
+#include "engine/oracle_prefetcher.h"
+
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -28,12 +30,19 @@ void BenchmarkReporter::set_run_info(const std::string& model_name,
 void BenchmarkReporter::write(const MetricsCollector& metrics,
                                const VmmStats& vmm_stats,
                                const StickyRouter::AggregateMetrics& routing_metrics) const {
+    write(metrics, vmm_stats, routing_metrics, PrefetchStats{});
+}
+
+void BenchmarkReporter::write(const MetricsCollector& metrics,
+                               const VmmStats& vmm_stats,
+                               const StickyRouter::AggregateMetrics& routing_metrics,
+                               const PrefetchStats& prefetch_stats) const {
     std::filesystem::create_directories(config_.output_dir);
 
     write_csv(config_.output_dir + "/benchmark_results.csv",
-              metrics, vmm_stats, routing_metrics);
+              metrics, vmm_stats, routing_metrics, prefetch_stats);
     write_json(config_.output_dir + "/benchmark_results.json",
-               metrics, vmm_stats, routing_metrics);
+               metrics, vmm_stats, routing_metrics, prefetch_stats);
     write_latex(config_.output_dir + "/benchmark_tables.tex",
                 metrics, vmm_stats, routing_metrics);
 }
@@ -44,6 +53,14 @@ void BenchmarkReporter::write_csv(const std::string& path,
                                    const MetricsCollector& metrics,
                                    const VmmStats& vmm_stats,
                                    const StickyRouter::AggregateMetrics& routing_metrics) const {
+    write_csv(path, metrics, vmm_stats, routing_metrics, PrefetchStats{});
+}
+
+void BenchmarkReporter::write_csv(const std::string& path,
+                                   const MetricsCollector& metrics,
+                                   const VmmStats& vmm_stats,
+                                   const StickyRouter::AggregateMetrics& routing_metrics,
+                                   const PrefetchStats& prefetch_stats) const {
     std::ofstream ofs(path);
     if (!ofs.is_open()) return;
 
@@ -51,7 +68,8 @@ void BenchmarkReporter::write_csv(const std::string& path,
     ofs << "model,tokens,total_time_ms,tok_per_sec,ttft_ms,"
            "latency_p50_ms,latency_p95_ms,latency_p99_ms,"
            "cache_hit_rate,switch_rate,avg_stickiness_window,"
-           "shift_detections,expert_reuse_ratio\n";
+           "shift_detections,expert_reuse_ratio,"
+           "prefetch_mode,effective_k\n";
 
     auto lat = metrics.get_histogram("token_latency_ms");
     double tok_per_sec = (total_time_ms_ > 0)
@@ -73,7 +91,7 @@ void BenchmarkReporter::write_csv(const std::string& path,
     // Data row
     char buf[1024];
     std::snprintf(buf, sizeof(buf),
-        "%s,%d,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,%.1f,%llu,%.4f\n",
+        "%s,%d,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,%.1f,%llu,%.4f,%s,%d\n",
         model_name_.c_str(),
         tokens_generated_,
         total_time_ms_,
@@ -86,7 +104,9 @@ void BenchmarkReporter::write_csv(const std::string& path,
         static_cast<double>(routing_metrics.switch_rate),
         static_cast<double>(routing_metrics.avg_window_length),
         static_cast<unsigned long long>(shift_detections),
-        expert_reuse_ratio);
+        expert_reuse_ratio,
+        prefetch_stats.mode.c_str(),
+        prefetch_stats.effective_k);
     ofs << buf;
 }
 
@@ -96,6 +116,14 @@ void BenchmarkReporter::write_json(const std::string& path,
                                     const MetricsCollector& metrics,
                                     const VmmStats& vmm_stats,
                                     const StickyRouter::AggregateMetrics& routing_metrics) const {
+    write_json(path, metrics, vmm_stats, routing_metrics, PrefetchStats{});
+}
+
+void BenchmarkReporter::write_json(const std::string& path,
+                                    const MetricsCollector& metrics,
+                                    const VmmStats& vmm_stats,
+                                    const StickyRouter::AggregateMetrics& routing_metrics,
+                                    const PrefetchStats& prefetch_stats) const {
     nlohmann::json j;
 
     // Run info
@@ -130,6 +158,16 @@ void BenchmarkReporter::write_json(const std::string& path,
         {"total_switches", routing_metrics.total_switches},
         {"switch_rate", routing_metrics.switch_rate},
         {"avg_window_length", routing_metrics.avg_window_length}
+    };
+
+    // Prefetch stats
+    j["prefetch"] = {
+        {"mode",                 prefetch_stats.mode},
+        {"rwp_oracle",           prefetch_stats.rwp_oracle},
+        {"rwp_best_baseline",    prefetch_stats.rwp_best_baseline},
+        {"effective_k",          prefetch_stats.effective_k},
+        {"speculative_hits",     prefetch_stats.speculative_hits},
+        {"speculative_misses",   prefetch_stats.speculative_misses}
     };
 
     // All metrics data

@@ -8,6 +8,7 @@
 /// standalone document wrapping.
 
 #include "engine/metrics.h"
+#include "engine/oracle_prefetcher.h"
 #include "engine/sticky_router.h"
 #include "vmm/vmm.h"
 
@@ -34,14 +35,30 @@ public:
                const VmmStats& vmm_stats,
                const StickyRouter::AggregateMetrics& routing_metrics) const;
 
+    /// Overload with optional prefetch stats.
+    void write(const MetricsCollector& metrics,
+               const VmmStats& vmm_stats,
+               const StickyRouter::AggregateMetrics& routing_metrics,
+               const PrefetchStats& prefetch_stats) const;
+
     /// Individual writers (public for testing).
     void write_csv(const std::string& path, const MetricsCollector& metrics,
                    const VmmStats& vmm_stats,
                    const StickyRouter::AggregateMetrics& routing_metrics) const;
 
+    void write_csv(const std::string& path, const MetricsCollector& metrics,
+                   const VmmStats& vmm_stats,
+                   const StickyRouter::AggregateMetrics& routing_metrics,
+                   const PrefetchStats& prefetch_stats) const;
+
     void write_json(const std::string& path, const MetricsCollector& metrics,
                     const VmmStats& vmm_stats,
                     const StickyRouter::AggregateMetrics& routing_metrics) const;
+
+    void write_json(const std::string& path, const MetricsCollector& metrics,
+                    const VmmStats& vmm_stats,
+                    const StickyRouter::AggregateMetrics& routing_metrics,
+                    const PrefetchStats& prefetch_stats) const;
 
     void write_latex(const std::string& path, const MetricsCollector& metrics,
                      const VmmStats& vmm_stats,

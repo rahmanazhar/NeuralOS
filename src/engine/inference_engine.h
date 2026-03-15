@@ -10,6 +10,7 @@
 #include "converter/model_config.h"
 #include "engine/attention.h"
 #include "engine/metrics.h"
+#include "engine/oracle_prefetcher.h"
 #include "engine/rope.h"
 #include "engine/router.h"
 #include "engine/sticky_router.h"
@@ -62,6 +63,13 @@ public:
 
     /// Configure sticky routing parameters. Call before load().
     void set_sticky_config(float lambda_override, int max_window);
+
+    /// Configure oracle prefetcher. Call before load().
+    /// enabled=false disables prefetch entirely (default: off).
+    void set_prefetch_config(bool enabled, int max_k = 10);
+
+    /// Current prefetch stats (populated after inference).
+    PrefetchStats prefetch_stats() const;
 
 private:
     struct Impl;

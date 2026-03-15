@@ -70,6 +70,8 @@ static void print_run_usage() {
         "  --output-dir PATH         Benchmark output directory (default: benchmark_results)\n"
         "  --standalone              LaTeX standalone mode (wraps with preamble)\n"
         "  --trace-routing           Write per-token routing trace to output-dir\n"
+        "  --prefetch               Enable oracle speculative prefetcher (default: off)\n"
+        "  --prefetch-k INT         Max lookahead depth (default: 10, range 1-10)\n"
         "  --help                    Show this help\n");
 }
 
@@ -220,6 +222,8 @@ static int cmd_run(int argc, char** argv) {
     bool bench_mode = false;
     bool standalone_latex = false;
     bool trace_routing = false;
+    bool prefetch_enabled = false;
+    int  prefetch_max_k   = 10;
 
     for (int i = 0; i < argc; i++) {
         if (std::strcmp(argv[i], "--help") == 0) {
@@ -261,6 +265,12 @@ static int cmd_run(int argc, char** argv) {
             standalone_latex = true;
         } else if (std::strcmp(argv[i], "--trace-routing") == 0) {
             trace_routing = true;
+        } else if (std::strcmp(argv[i], "--prefetch") == 0) {
+            prefetch_enabled = true;
+        } else if (std::strcmp(argv[i], "--prefetch-k") == 0 && i + 1 < argc) {
+            prefetch_max_k = std::atoi(argv[++i]);
+            if (prefetch_max_k < 1)  prefetch_max_k = 1;
+            if (prefetch_max_k > 10) prefetch_max_k = 10;
         }
     }
 
@@ -290,6 +300,7 @@ static int cmd_run(int argc, char** argv) {
     // Load engine with thread count
     nos::InferenceEngine engine;
     engine.set_sticky_config(sticky_lambda, sticky_window);
+    engine.set_prefetch_config(prefetch_enabled, prefetch_max_k);
     if (!engine.load(model_dir, vmm.get(), threads)) {
         std::fprintf(stderr, "ERROR: Failed to load model\n");
         return 1;
@@ -435,7 +446,12 @@ static int cmd_run(int argc, char** argv) {
     if (bench_mode) {
         nos::BenchmarkReporter reporter({{output_dir}, standalone_latex});
         reporter.set_run_info(model_dir, generated_count, elapsed_ms, ttft_ms);
-        reporter.write(engine.metrics(), vmm_stats, routing);
+        if (prefetch_enabled) {
+            reporter.write(engine.metrics(), vmm_stats, routing,
+                           engine.prefetch_stats());
+        } else {
+            reporter.write(engine.metrics(), vmm_stats, routing);
+        }
         std::fprintf(stderr, "  Benchmark output written to: %s/\n", output_dir.c_str());
     }
 

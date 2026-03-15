@@ -3,6 +3,7 @@
 
 #include "engine/inference_engine.h"
 #include "engine/metrics.h"
+#include "engine/oracle_prefetcher.h"
 #include "engine/rmsnorm.h"
 #include "engine/shift_detector.h"
 #include "engine/sticky_router.h"
@@ -104,6 +105,11 @@ struct InferenceEngine::Impl {
     StickyRouter sticky_router;
     ShiftDetector shift_detector;
     std::vector<float> prev_hidden_state;
+
+    // Oracle prefetcher (optional, constructed in load() if prefetch_enabled)
+    std::unique_ptr<OraclePrefetcher> oracle_prefetcher;
+    bool prefetch_enabled = false;
+    int  prefetch_max_k   = 10;
 
     // Metrics and TTFT tracking
     MetricsCollector metrics_collector;
@@ -422,6 +428,16 @@ bool InferenceEngine::load(const std::string& model_dir, Vmm* vmm, int num_threa
     impl_->metrics_collector.register_defaults();
     impl_->inference_start = std::chrono::high_resolution_clock::now();
 
+    // --- Initialize oracle prefetcher (if enabled) ---
+    if (impl_->prefetch_enabled && impl_->vmm) {
+        OraclePrefetcher::Config pcfg;
+        pcfg.n_layers   = static_cast<int>(mc.n_layers);
+        pcfg.num_experts = static_cast<int>(mc.expert_count);
+        pcfg.max_k       = impl_->prefetch_max_k;
+        impl_->oracle_prefetcher = std::make_unique<OraclePrefetcher>(
+            pcfg, impl_->vmm, &impl_->metrics_collector);
+    }
+
     return true;
 }
 
@@ -438,6 +454,7 @@ void InferenceEngine::reset_kv_cache() {
     impl_->ttft_recorded = false;
     impl_->token_count = 0;
     impl_->inference_start = std::chrono::high_resolution_clock::now();
+    if (impl_->oracle_prefetcher) impl_->oracle_prefetcher->reset();
 }
 
 const float* InferenceEngine::forward_step(int token_id, int pos) {
@@ -573,17 +590,18 @@ const float* InferenceEngine::forward_step(int token_id, int pos) {
                 impl_->metrics_collector.inc_counter("expert_switches");
             }
 
-            // 2j'. Next-layer prefetch: speculatively load L+1 experts
-            // during current-layer compute. Uses current norm_out as proxy
-            // for next layer's input (correlated, good enough for prefetch).
-            if (L + 1 < n_layers && impl_->vmm
-                    && !impl_->router_weights[sz(L + 1)].empty()) {
-                RouterResult next_route = impl_->routers[sz(L + 1)].route(
-                    impl_->norm_out.data(), top_k);
-                for (size_t ni = 0; ni < next_route.expert_ids.size(); ni++) {
-                    impl_->vmm->prefetch_expert(
-                        static_cast<uint32_t>(L + 1), next_route.expert_ids[ni]);
-                }
+            // 2j'. Oracle prefetch: replaces naive 1-layer lookahead with
+            // variable-K speculative prefetch via OraclePrefetcher.
+            if (impl_->oracle_prefetcher) {
+                const float* raw_logits = route.raw_scores.empty()
+                    ? nullptr : route.raw_scores.data();
+                impl_->oracle_prefetcher->predict_and_dispatch(
+                    L,
+                    route.expert_ids,
+                    raw_logits,             // router_logits (may be null; handled in oracle)
+                    impl_->norm_out.data(), // hidden_state proxy
+                    hidden_dim,
+                    top_k);
             }
 
             // 2k. Zero MoE output
@@ -819,7 +837,33 @@ const float* InferenceEngine::forward_step(int token_id, int pos) {
             "memory_utilization", ts, resident_ratio);
     }
 
+    // Tick oracle prefetcher once per token (after all layers done)
+    if (impl_->oracle_prefetcher) {
+        double tok_per_sec = 0.0;
+        auto tl = impl_->metrics_collector.get_timeline("tok_per_sec");
+        if (tl.points.size() >= 2) {
+            auto& back = tl.points.back();
+            auto& prev = tl.points[tl.points.size() - 2];
+            if (back.first > prev.first) {
+                tok_per_sec = 1000.0 / (back.first - prev.first);
+            }
+        }
+        impl_->oracle_prefetcher->tick(tok_per_sec);
+    }
+
     return impl_->logits.data();
+}
+
+void InferenceEngine::set_prefetch_config(bool enabled, int max_k) {
+    impl_->prefetch_enabled = enabled;
+    impl_->prefetch_max_k   = max_k;
+}
+
+PrefetchStats InferenceEngine::prefetch_stats() const {
+    if (impl_->oracle_prefetcher) {
+        return impl_->oracle_prefetcher->stats();
+    }
+    return PrefetchStats{};
 }
 
 }  // namespace nos
