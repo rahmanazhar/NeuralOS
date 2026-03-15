@@ -15,6 +15,7 @@ add_library(nos_engine STATIC
     benchmark.cpp
     prefetch_predictor.cpp
     oracle_lstm.cpp
+    oracle_prefetcher.cpp
 )
 
 target_include_directories(nos_engine PUBLIC ${CMAKE_SOURCE_DIR}/src)
