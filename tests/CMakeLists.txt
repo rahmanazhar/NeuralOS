@@ -402,3 +402,13 @@ target_link_libraries(test_benchmark_output
 )
 
 catch_discover_tests(test_benchmark_output)
+
+# -- Oracle LSTM Tests --
+add_executable(test_oracle_lstm test_oracle_lstm.cpp)
+target_link_libraries(test_oracle_lstm PRIVATE Catch2::Catch2WithMain nos_engine)
+catch_discover_tests(test_oracle_lstm)
+
+# -- Prefetch Predictor Tests --
+add_executable(test_prefetch_predictor test_prefetch_predictor.cpp)
+target_link_libraries(test_prefetch_predictor PRIVATE Catch2::Catch2WithMain nos_engine)
+catch_discover_tests(test_prefetch_predictor)
