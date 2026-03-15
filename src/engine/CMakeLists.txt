@@ -13,6 +13,7 @@ add_library(nos_engine STATIC
     sticky_router.cpp
     metrics.cpp
     benchmark.cpp
+    prefetch_predictor.cpp
 )
 
 target_include_directories(nos_engine PUBLIC ${CMAKE_SOURCE_DIR}/src)
