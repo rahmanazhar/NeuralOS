@@ -5,6 +5,7 @@
 
 #include "api/libneuralos.h"
 
+#include <cstddef>
 #include <memory>
 #include <string>
 
@@ -17,6 +18,7 @@ public:
         int port = 8080;
         std::string model_path;
         nos_config_t inference_config{};
+        size_t max_slots = 4;  ///< Number of concurrent inference slots
     };
 
     HttpServer();
@@ -78,6 +80,9 @@ public:
         const std::string& message,
         const std::string& type,
         int code);
+
+    /// Update shared metrics (throttled to 100ms intervals). Called internally.
+    void update_shared_metrics();
 
 private:
     struct Impl;

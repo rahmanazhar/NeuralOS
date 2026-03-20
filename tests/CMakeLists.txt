@@ -459,3 +459,15 @@ add_executable(test_lora test_lora.cpp)
 target_link_libraries(test_lora PRIVATE Catch2::Catch2WithMain nos_training)
 target_include_directories(test_lora PRIVATE ${CMAKE_SOURCE_DIR}/src)
 catch_discover_tests(test_lora)
+
+# ── SharedMetrics Tests ──────────────────────────────────────────────
+add_executable(test_shared_metrics test_shared_metrics.cpp)
+target_link_libraries(test_shared_metrics PRIVATE Catch2::Catch2WithMain nos_server)
+target_include_directories(test_shared_metrics PRIVATE ${CMAKE_SOURCE_DIR}/src)
+catch_discover_tests(test_shared_metrics)
+
+# ── RequestScheduler Tests ───────────────────────────────────────────
+add_executable(test_request_scheduler test_request_scheduler.cpp)
+target_link_libraries(test_request_scheduler PRIVATE Catch2::Catch2WithMain nos_server)
+target_include_directories(test_request_scheduler PRIVATE ${CMAKE_SOURCE_DIR}/src)
+catch_discover_tests(test_request_scheduler)

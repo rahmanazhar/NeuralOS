@@ -3,6 +3,8 @@
 add_library(nos_server STATIC
     http_server.cpp
     chat_template.cpp
+    shared_metrics.cpp
+    request_scheduler.cpp
 )
 
 target_link_libraries(nos_server

@@ -1,8 +1,11 @@
 /// @file http_server.cpp
-/// @brief HTTP server implementation with OpenAI-compatible endpoints and SSE streaming.
+/// @brief HTTP server implementation with OpenAI-compatible endpoints, SSE streaming,
+///        multi-sequence batching via RequestScheduler, and shared metrics via MetricsWriter.
 
 #include "server/http_server.h"
 #include "server/chat_template.h"
+#include "server/request_scheduler.h"
+#include "server/shared_metrics.h"
 #include "api/libneuralos.h"
 
 #include <httplib.h>
@@ -16,6 +19,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <unistd.h>  // getpid
 
 namespace nos {
 
@@ -33,6 +38,13 @@ static long unix_timestamp() {
     return static_cast<long>(
         std::chrono::duration_cast<std::chrono::seconds>(
             now.time_since_epoch()).count());
+}
+
+static double epoch_seconds() {
+    auto now = std::chrono::system_clock::now();
+    return static_cast<double>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count()) / 1000.0;
 }
 
 // ── JSON Response Builders ──────────────────────────────────────────────────
@@ -162,11 +174,15 @@ static void set_cors_headers(httplib::Response& res) {
 
 struct HttpServer::Impl {
     httplib::Server svr;
-    nos_ctx_t* ctx = nullptr;
+    std::unique_ptr<RequestScheduler> scheduler;
+    std::unique_ptr<MetricsWriter> metrics_writer;
     std::string model_path;
-    std::mutex inference_mutex;  // Serialize inference calls (single context)
+    std::string shm_name;
     std::atomic<bool> running{false};
     std::thread server_thread;
+
+    // Throttle metrics writes to every 100ms
+    std::chrono::steady_clock::time_point last_metrics_write{};
 };
 
 HttpServer::HttpServer() : impl_(std::make_unique<Impl>()) {}
@@ -180,12 +196,22 @@ bool HttpServer::start(const Config& config) {
 
     impl_->model_path = config.model_path;
 
-    // Create inference context
-    impl_->ctx = nos_create(config.model_path.c_str(), config.inference_config);
-    if (impl_->ctx == nullptr) {
-        std::fprintf(stderr, "HttpServer: Failed to create context: %s\n",
+    // Create request scheduler with multiple slots
+    impl_->scheduler = std::make_unique<RequestScheduler>(
+        config.max_slots, config.model_path, config.inference_config);
+
+    if (!impl_->scheduler->is_ready()) {
+        std::fprintf(stderr, "HttpServer: Failed to create any inference slots: %s\n",
                      nos_last_error());
         return false;
+    }
+
+    // Create shared memory metrics writer
+    impl_->shm_name = "/neuralos_metrics_" + std::to_string(getpid());
+    impl_->metrics_writer = std::make_unique<MetricsWriter>(impl_->shm_name);
+    if (!impl_->metrics_writer->is_open()) {
+        std::fprintf(stderr, "HttpServer: Warning: Could not create shared metrics segment\n");
+        // Non-fatal -- server can run without metrics
     }
 
     // ── OPTIONS preflight ───────────────────────────────────────────────
@@ -200,9 +226,12 @@ bool HttpServer::start(const Config& config) {
                                      httplib::Response& res) {
         set_cors_headers(res);
         nlohmann::json j;
-        if (impl_->ctx != nullptr) {
+        if (impl_->scheduler && impl_->scheduler->is_ready()) {
             j["status"] = "ready";
             j["model"] = impl_->model_path;
+            j["active_slots"] = impl_->scheduler->active_count();
+            j["max_slots"] = impl_->scheduler->slot_count();
+            j["shm_name"] = impl_->shm_name;
             res.status = 200;
         } else {
             j["status"] = "error";
@@ -242,13 +271,25 @@ bool HttpServer::start(const Config& config) {
         std::string req_id = generate_request_id();
         long ts = unix_timestamp();
 
+        // Acquire a slot from the scheduler
+        auto guard = impl_->scheduler->acquire_slot_guard();
+        if (!guard) {
+            res.status = 503;
+            res.set_content(
+                build_error_response("Server busy -- all inference slots in use",
+                                     "server_error", 503),
+                "application/json");
+            return;
+        }
+
+        nos_ctx_t* ctx = guard->ctx;
+
         if (!stream) {
             // Non-streaming: use nos_generate
-            std::lock_guard<std::mutex> lock(impl_->inference_mutex);
-            nos_reset(impl_->ctx);
+            nos_reset(ctx);
 
             std::vector<char> buf(static_cast<size_t>(max_tokens) * 16 + 1);
-            int rc = nos_generate(impl_->ctx, prompt.c_str(),
+            int rc = nos_generate(ctx, prompt.c_str(),
                                   buf.data(), buf.size());
             if (rc != NOS_OK && rc != NOS_ERR_BUFFER) {
                 res.status = 500;
@@ -263,14 +304,17 @@ bool HttpServer::start(const Config& config) {
             // Count prompt tokens
             int prompt_ids[4096];
             size_t num_prompt = 0;
-            nos_tokenize(impl_->ctx, prompt.c_str(), prompt_ids, 4096, &num_prompt);
+            nos_tokenize(ctx, prompt.c_str(), prompt_ids, 4096, &num_prompt);
             int prompt_tok = static_cast<int>(num_prompt);
 
             // Count completion tokens
             int comp_ids[4096];
             size_t num_comp = 0;
-            nos_tokenize(impl_->ctx, text.c_str(), comp_ids, 4096, &num_comp);
+            nos_tokenize(ctx, text.c_str(), comp_ids, 4096, &num_comp);
             int comp_tok = static_cast<int>(num_comp);
+
+            // Update shared metrics (throttled)
+            update_shared_metrics();
 
             res.status = 200;
             res.set_content(
@@ -279,19 +323,18 @@ bool HttpServer::start(const Config& config) {
                 "application/json");
         } else {
             // Streaming: SSE via chunked content provider
-            std::lock_guard<std::mutex> lock(impl_->inference_mutex);
-            nos_reset(impl_->ctx);
+            nos_reset(ctx);
 
             // Tokenize prompt first
             int prompt_ids[4096];
             size_t num_prompt = 0;
-            nos_tokenize(impl_->ctx, prompt.c_str(),
+            nos_tokenize(ctx, prompt.c_str(),
                          prompt_ids, 4096, &num_prompt);
 
             // Step through prompt tokens
             int out_token = 0;
             for (size_t i = 0; i < num_prompt; ++i) {
-                nos_step_token(impl_->ctx, prompt_ids[i], &out_token);
+                nos_step_token(ctx, prompt_ids[i], &out_token);
             }
 
             // Capture state for the chunked provider
@@ -305,7 +348,7 @@ bool HttpServer::start(const Config& config) {
                 bool done;
             };
             auto state = std::make_shared<StreamState>();
-            state->ctx = impl_->ctx;
+            state->ctx = ctx;
             state->req_id = req_id;
             state->model = impl_->model_path;
             state->ts = ts;
@@ -418,12 +461,24 @@ bool HttpServer::start(const Config& config) {
         std::string req_id = generate_request_id();
         long ts = unix_timestamp();
 
+        // Acquire a slot from the scheduler
+        auto guard = impl_->scheduler->acquire_slot_guard();
+        if (!guard) {
+            res.status = 503;
+            res.set_content(
+                build_error_response("Server busy -- all inference slots in use",
+                                     "server_error", 503),
+                "application/json");
+            return;
+        }
+
+        nos_ctx_t* ctx = guard->ctx;
+
         if (!stream) {
-            std::lock_guard<std::mutex> lock(impl_->inference_mutex);
-            nos_reset(impl_->ctx);
+            nos_reset(ctx);
 
             std::vector<char> buf(static_cast<size_t>(max_tokens) * 16 + 1);
-            int rc = nos_generate(impl_->ctx, prompt.c_str(),
+            int rc = nos_generate(ctx, prompt.c_str(),
                                   buf.data(), buf.size());
             if (rc != NOS_OK && rc != NOS_ERR_BUFFER) {
                 res.status = 500;
@@ -438,13 +493,16 @@ bool HttpServer::start(const Config& config) {
             // Count tokens
             int prompt_ids[4096];
             size_t num_prompt = 0;
-            nos_tokenize(impl_->ctx, prompt.c_str(), prompt_ids, 4096, &num_prompt);
+            nos_tokenize(ctx, prompt.c_str(), prompt_ids, 4096, &num_prompt);
             int prompt_tok = static_cast<int>(num_prompt);
 
             int comp_ids[4096];
             size_t num_comp = 0;
-            nos_tokenize(impl_->ctx, content.c_str(), comp_ids, 4096, &num_comp);
+            nos_tokenize(ctx, content.c_str(), comp_ids, 4096, &num_comp);
             int comp_tok = static_cast<int>(num_comp);
+
+            // Update shared metrics (throttled)
+            update_shared_metrics();
 
             res.status = 200;
             res.set_content(
@@ -452,17 +510,16 @@ bool HttpServer::start(const Config& config) {
                                                content, "stop", prompt_tok, comp_tok),
                 "application/json");
         } else {
-            std::lock_guard<std::mutex> lock(impl_->inference_mutex);
-            nos_reset(impl_->ctx);
+            nos_reset(ctx);
 
             int prompt_ids[4096];
             size_t num_prompt = 0;
-            nos_tokenize(impl_->ctx, prompt.c_str(),
+            nos_tokenize(ctx, prompt.c_str(),
                          prompt_ids, 4096, &num_prompt);
 
             int out_token = 0;
             for (size_t i = 0; i < num_prompt; ++i) {
-                nos_step_token(impl_->ctx, prompt_ids[i], &out_token);
+                nos_step_token(ctx, prompt_ids[i], &out_token);
             }
 
             struct StreamState {
@@ -475,7 +532,7 @@ bool HttpServer::start(const Config& config) {
                 bool done;
             };
             auto state = std::make_shared<StreamState>();
-            state->ctx = impl_->ctx;
+            state->ctx = ctx;
             state->req_id = req_id;
             state->model = impl_->model_path;
             state->ts = ts;
@@ -557,15 +614,32 @@ void HttpServer::stop() {
     if (impl_->server_thread.joinable()) {
         impl_->server_thread.join();
     }
-    if (impl_->ctx != nullptr) {
-        nos_destroy(impl_->ctx);
-        impl_->ctx = nullptr;
-    }
+    // Scheduler destructor handles nos_destroy for all slots
+    impl_->scheduler.reset();
+    impl_->metrics_writer.reset();
     impl_->running.store(false);
 }
 
 bool HttpServer::is_running() const {
     return impl_->running.load();
+}
+
+void HttpServer::update_shared_metrics() {
+    if (!impl_->metrics_writer || !impl_->metrics_writer->is_open()) return;
+
+    // Throttle to every 100ms
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - impl_->last_metrics_write);
+    if (elapsed.count() < 100) return;
+    impl_->last_metrics_write = now;
+
+    SharedMetrics m{};
+    m.last_update_epoch = epoch_seconds();
+    m.active_slots = static_cast<uint32_t>(impl_->scheduler->active_count());
+    m.max_slots = static_cast<uint32_t>(impl_->scheduler->slot_count());
+
+    impl_->metrics_writer->update(m);
 }
 
 }  // namespace nos
