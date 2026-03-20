@@ -12,10 +12,32 @@
 #include "engine/sticky_router.h"
 #include "vmm/vmm.h"
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
 namespace nos {
+
+/// Captures one benchmark run's data for paper Table 1 generation.
+struct BenchRunResult {
+    std::string model_name;
+    std::string model_size;           ///< e.g., "70B"
+    int tokens_generated = 0;
+    double total_time_ms = 0.0;
+    double ttft_ms = 0.0;
+    double tok_per_sec = 0.0;
+    double cache_hit_rate = 0.0;
+    double switch_rate = 0.0;
+    double avg_sticky_window = 0.0;
+    double prefetch_rwp = 0.0;
+    std::string prefetch_mode = "none";
+    int effective_k = 0;
+    double waste_ratio = 0.0;
+    size_t memory_budget_mb = 0;
+    int num_threads = 0;
+    int concurrent_sequences = 0;     ///< for multi-seq batch test
+    double multi_seq_tok_per_sec = 0.0; ///< aggregate throughput with batching
+};
 
 class BenchmarkReporter {
 public:
@@ -70,6 +92,24 @@ public:
         const std::string& caption,
         const std::vector<std::string>& headers,
         const std::vector<std::vector<std::string>>& rows) const;
+
+    // ── Paper Table 1 generation from BenchRunResult ────────────────────
+
+    /// Write LaTeX table matching paper Table 1 format with booktabs.
+    void write_paper_table(const std::string& path,
+                           const std::vector<BenchRunResult>& results) const;
+
+    /// Write comparison LaTeX table for multiple configurations.
+    void write_comparison_table(const std::string& path,
+                                const std::vector<BenchRunResult>& results) const;
+
+    /// Write JSON array of all run results.
+    void write_paper_json(const std::string& path,
+                          const std::vector<BenchRunResult>& results) const;
+
+    /// Write CSV with all fields for spreadsheet import.
+    void write_paper_csv(const std::string& path,
+                         const std::vector<BenchRunResult>& results) const;
 
 private:
     Config config_;

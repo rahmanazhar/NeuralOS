@@ -477,3 +477,9 @@ add_executable(test_request_scheduler test_request_scheduler.cpp)
 target_link_libraries(test_request_scheduler PRIVATE Catch2::Catch2WithMain nos_server)
 target_include_directories(test_request_scheduler PRIVATE ${CMAKE_SOURCE_DIR}/src)
 catch_discover_tests(test_request_scheduler)
+
+# ── Bench Command Tests ─────────────────────────────────────────────
+add_executable(test_bench_command test_bench_command.cpp)
+target_link_libraries(test_bench_command PRIVATE Catch2::Catch2WithMain nos_engine)
+target_include_directories(test_bench_command PRIVATE ${CMAKE_SOURCE_DIR}/src)
+catch_discover_tests(test_bench_command)
