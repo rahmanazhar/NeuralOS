@@ -46,6 +46,14 @@ FetchContent_Declare(json
 )
 FetchContent_MakeAvailable(json)
 
+# ── cpp-httplib ────────────────────────────────────────────────────────────
+
+FetchContent_Declare(httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG        v0.18.3
+)
+FetchContent_MakeAvailable(httplib)
+
 # ── liburing (Linux only) ──────────────────────────────────────────────────
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

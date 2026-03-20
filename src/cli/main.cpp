@@ -1,5 +1,5 @@
 /// @file main.cpp
-/// @brief NeuralOS CLI: convert, run, and perplexity subcommands.
+/// @brief NeuralOS CLI: convert, run, perplexity, and serve subcommands.
 
 #include "converter/conversion_pipeline.h"
 #include "converter/model_config.h"
@@ -7,11 +7,13 @@
 #include "engine/inference_engine.h"
 #include "engine/perplexity.h"
 #include "engine/sampling.h"
+#include "server/http_server.h"
 #include "tokenizer/tokenizer.h"
 #include "vmm/memory_budget.h"
 #include "vmm/vmm.h"
 
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +22,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -30,6 +33,7 @@ static void print_usage() {
         "Subcommands:\n"
         "  convert     Convert a model to NeuralOS .nxp format\n"
         "  run         Generate text from a converted model\n"
+        "  serve       Start OpenAI-compatible HTTP server\n"
         "  perplexity  Evaluate model perplexity on a text file\n\n"
         "Use 'neuralos <subcommand> --help' for subcommand-specific options.\n");
 }
@@ -550,6 +554,124 @@ static int cmd_perplexity(int argc, char** argv) {
     return 0;
 }
 
+// ── Serve subcommand ────────────────────────────────────────────────────────
+
+static void print_serve_usage() {
+    std::fprintf(stderr,
+        "Usage: neuralos serve [options]\n\n"
+        "Options:\n"
+        "  --model PATH              Converted model directory (required)\n"
+        "  --port INT                Server port (default: 8080)\n"
+        "  --host STRING             Bind address (default: 127.0.0.1)\n"
+        "  --memory SIZE             Memory budget (default: 8G)\n"
+        "  --temperature FLOAT       Sampling temperature (default: 1.0)\n"
+        "  --top-k INT               Top-k filtering (default: 40)\n"
+        "  --top-p FLOAT             Top-p nucleus sampling (default: 0.95)\n"
+        "  --threads N               Thread count (0=auto)\n"
+        "  --sticky-lambda FLOAT     Override adaptive lambda (-1=auto)\n"
+        "  --sticky-window INT       Max stickiness window (default: 128)\n"
+        "  --prefetch                Enable oracle prefetcher\n"
+        "  --prefetch-k INT          Max lookahead depth (default: 10)\n"
+        "  --help                    Show this help\n");
+}
+
+static volatile std::sig_atomic_t g_running = 1;
+
+static void signal_handler(int /*sig*/) {
+    g_running = 0;
+}
+
+static int cmd_serve(int argc, char** argv) {
+    std::string model_dir, memory_str = "8G", host = "127.0.0.1";
+    int port = 8080;
+    float temperature = 1.0f;
+    int top_k = 40;
+    float top_p = 0.95f;
+    int threads = 0;
+    float sticky_lambda = -1.0f;
+    int sticky_window = 128;
+    bool prefetch_enabled = false;
+    int  prefetch_max_k = 10;
+
+    for (int i = 0; i < argc; i++) {
+        if (std::strcmp(argv[i], "--help") == 0) {
+            print_serve_usage();
+            return 0;
+        } else if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+            model_dir = argv[++i];
+        } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            port = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
+            host = argv[++i];
+        } else if (std::strcmp(argv[i], "--memory") == 0 && i + 1 < argc) {
+            memory_str = argv[++i];
+        } else if (std::strcmp(argv[i], "--temperature") == 0 && i + 1 < argc) {
+            temperature = std::strtof(argv[++i], nullptr);
+        } else if (std::strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) {
+            top_k = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) {
+            top_p = std::strtof(argv[++i], nullptr);
+        } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            threads = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--sticky-lambda") == 0 && i + 1 < argc) {
+            sticky_lambda = std::strtof(argv[++i], nullptr);
+        } else if (std::strcmp(argv[i], "--sticky-window") == 0 && i + 1 < argc) {
+            sticky_window = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--prefetch") == 0) {
+            prefetch_enabled = true;
+        } else if (std::strcmp(argv[i], "--prefetch-k") == 0 && i + 1 < argc) {
+            prefetch_max_k = std::atoi(argv[++i]);
+            if (prefetch_max_k < 1)  prefetch_max_k = 1;
+            if (prefetch_max_k > 10) prefetch_max_k = 10;
+        }
+    }
+
+    if (model_dir.empty()) {
+        std::fprintf(stderr, "ERROR: --model is required\n");
+        print_serve_usage();
+        return 1;
+    }
+
+    nos::HttpServer::Config srv_cfg;
+    srv_cfg.host = host;
+    srv_cfg.port = port;
+    srv_cfg.model_path = model_dir;
+
+    std::memset(&srv_cfg.inference_config, 0, sizeof(nos_config_t));
+    srv_cfg.inference_config.struct_size = sizeof(nos_config_t);
+    srv_cfg.inference_config.temperature = temperature;
+    srv_cfg.inference_config.top_k = top_k;
+    srv_cfg.inference_config.top_p = top_p;
+    srv_cfg.inference_config.repetition_penalty = 1.1f;
+    srv_cfg.inference_config.min_p = 0.05f;
+    srv_cfg.inference_config.sticky_lambda = sticky_lambda;
+    srv_cfg.inference_config.sticky_window = sticky_window;
+    srv_cfg.inference_config.num_threads = threads;
+    srv_cfg.inference_config.memory_budget = nos::parse_memory_string(memory_str);
+    srv_cfg.inference_config.prefetch_enabled = prefetch_enabled ? 1 : 0;
+    srv_cfg.inference_config.prefetch_max_k = prefetch_max_k;
+
+    nos::HttpServer server;
+    if (!server.start(srv_cfg)) {
+        std::fprintf(stderr, "ERROR: Failed to start HTTP server\n");
+        return 1;
+    }
+
+    std::fprintf(stderr, "Listening on http://%s:%d\n", host.c_str(), port);
+    std::fprintf(stderr, "Press Ctrl+C to stop.\n");
+
+    // Wait for SIGINT
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+    while (g_running != 0 && server.is_running()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    std::fprintf(stderr, "\nShutting down...\n");
+    server.stop();
+    return 0;
+}
+
 // ── Main entry ──────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -567,6 +689,8 @@ int main(int argc, char** argv) {
         return cmd_convert(argc - 2, argv + 2);
     } else if (std::strcmp(cmd, "run") == 0) {
         return cmd_run(argc - 2, argv + 2);
+    } else if (std::strcmp(cmd, "serve") == 0) {
+        return cmd_serve(argc - 2, argv + 2);
     } else if (std::strcmp(cmd, "perplexity") == 0) {
         return cmd_perplexity(argc - 2, argv + 2);
     } else {

@@ -11,6 +11,7 @@ target_link_libraries(neuralos
         nos_kernel
         nos_io
         nos_format
+        nos_server
 )
 
 target_include_directories(neuralos

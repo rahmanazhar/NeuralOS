@@ -423,3 +423,15 @@ add_executable(test_libneuralos test_libneuralos.cpp)
 target_link_libraries(test_libneuralos PRIVATE Catch2::Catch2WithMain neuralos_shared)
 target_include_directories(test_libneuralos PRIVATE ${CMAKE_SOURCE_DIR}/src)
 catch_discover_tests(test_libneuralos)
+
+# ── Chat Template Tests ───────────────────────────────────────────────
+add_executable(test_chat_template test_chat_template.cpp)
+target_link_libraries(test_chat_template PRIVATE Catch2::Catch2WithMain nos_server)
+target_include_directories(test_chat_template PRIVATE ${CMAKE_SOURCE_DIR}/src)
+catch_discover_tests(test_chat_template)
+
+# ── HTTP Server Tests ─────────────────────────────────────────────────
+add_executable(test_http_server test_http_server.cpp)
+target_link_libraries(test_http_server PRIVATE Catch2::Catch2WithMain nos_server)
+target_include_directories(test_http_server PRIVATE ${CMAKE_SOURCE_DIR}/src)
+catch_discover_tests(test_http_server)
