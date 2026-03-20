@@ -435,3 +435,21 @@ add_executable(test_http_server test_http_server.cpp)
 target_link_libraries(test_http_server PRIVATE Catch2::Catch2WithMain nos_server)
 target_include_directories(test_http_server PRIVATE ${CMAKE_SOURCE_DIR}/src)
 catch_discover_tests(test_http_server)
+
+# ── DataLoader Tests ─────────────────────────────────────────────────
+add_executable(test_data_loader test_data_loader.cpp)
+target_link_libraries(test_data_loader PRIVATE Catch2::Catch2WithMain nos_training)
+target_include_directories(test_data_loader PRIVATE ${CMAKE_SOURCE_DIR}/src)
+catch_discover_tests(test_data_loader)
+
+# ── BAdam Tests ──────────────────────────────────────────────────────
+add_executable(test_badam test_badam.cpp)
+target_link_libraries(test_badam PRIVATE Catch2::Catch2WithMain nos_training)
+target_include_directories(test_badam PRIVATE ${CMAKE_SOURCE_DIR}/src)
+catch_discover_tests(test_badam)
+
+# ── GaLore Tests ─────────────────────────────────────────────────────
+add_executable(test_galore test_galore.cpp)
+target_link_libraries(test_galore PRIVATE Catch2::Catch2WithMain nos_training)
+target_include_directories(test_galore PRIVATE ${CMAKE_SOURCE_DIR}/src)
+catch_discover_tests(test_galore)
