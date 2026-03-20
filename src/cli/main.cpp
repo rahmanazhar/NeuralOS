@@ -3,6 +3,7 @@
 
 #include "converter/conversion_pipeline.h"
 #include "converter/model_config.h"
+#include "dashboard/dashboard.h"
 #include "engine/benchmark.h"
 #include "engine/inference_engine.h"
 #include "engine/perplexity.h"
@@ -27,6 +28,7 @@
 #include <thread>
 #include <vector>
 
+#include <httplib.h>
 #include <nlohmann/json.hpp>
 
 static void print_usage() {
@@ -38,6 +40,7 @@ static void print_usage() {
         "  train       Train or fine-tune a model\n"
         "  merge-lora  Merge LoRA adapter into base model\n"
         "  serve       Start OpenAI-compatible HTTP server\n"
+        "  dashboard   Live TUI dashboard for a running server\n"
         "  perplexity  Evaluate model perplexity on a text file\n\n"
         "Use 'neuralos <subcommand> --help' for subcommand-specific options.\n");
 }
@@ -854,6 +857,87 @@ static int cmd_serve(int argc, char** argv) {
     return 0;
 }
 
+// ── Dashboard subcommand ────────────────────────────────────────────────────
+
+static void print_dashboard_usage() {
+    std::fprintf(stderr,
+        "Usage: neuralos dashboard [options]\n\n"
+        "Options:\n"
+        "  --host STRING             Server host (default: 127.0.0.1)\n"
+        "  --port INT                Server port (default: 8080)\n"
+        "  --refresh-ms INT          Refresh interval in ms (default: 500)\n"
+        "  --help                    Show this help\n");
+}
+
+static int cmd_dashboard(int argc, char** argv) {
+    std::string host = "127.0.0.1";
+    int port = 8080;
+    int refresh_ms = 500;
+
+    for (int i = 0; i < argc; i++) {
+        if (std::strcmp(argv[i], "--help") == 0) {
+            print_dashboard_usage();
+            return 0;
+        } else if (std::strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
+            host = argv[++i];
+        } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            port = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--refresh-ms") == 0 && i + 1 < argc) {
+            refresh_ms = std::atoi(argv[++i]);
+            if (refresh_ms < 100) refresh_ms = 100;
+        }
+    }
+
+    // Connect to server health endpoint to discover shm_name.
+    // Use httplib client for the health check.
+    std::string base_url = host + ":" + std::to_string(port);
+    httplib::Client client(host, port);
+    client.set_connection_timeout(2);  // 2 second timeout
+    client.set_read_timeout(2);
+
+    auto res = client.Get("/health");
+    if (!res || res->status != 200) {
+        std::fprintf(stderr,
+            "Cannot connect to server at %s:%d\n"
+            "Make sure 'neuralos serve' is running.\n",
+            host.c_str(), port);
+        return 1;
+    }
+
+    // Parse health response for shm_name
+    std::string shm_name;
+    try {
+        auto j = nlohmann::json::parse(res->body);
+        if (j.contains("shm_name")) {
+            shm_name = j["shm_name"].get<std::string>();
+        }
+    } catch (...) {
+        std::fprintf(stderr, "Invalid health response from server\n");
+        return 1;
+    }
+
+    if (shm_name.empty()) {
+        std::fprintf(stderr, "Server did not report shared metrics name\n");
+        return 1;
+    }
+
+    std::fprintf(stderr, "Connected to server at %s:%d (shm: %s)\n",
+                 host.c_str(), port, shm_name.c_str());
+
+    nos::Dashboard dashboard;
+    nos::Dashboard::Config cfg;
+    cfg.shm_name = shm_name;
+    cfg.refresh_ms = refresh_ms;
+
+    if (!dashboard.start(cfg)) {
+        return 1;
+    }
+
+    dashboard.run();
+    dashboard.stop();
+    return 0;
+}
+
 // ── Main entry ──────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
@@ -877,6 +961,8 @@ int main(int argc, char** argv) {
         return cmd_merge(argc - 2, argv + 2);
     } else if (std::strcmp(cmd, "serve") == 0) {
         return cmd_serve(argc - 2, argv + 2);
+    } else if (std::strcmp(cmd, "dashboard") == 0) {
+        return cmd_dashboard(argc - 2, argv + 2);
     } else if (std::strcmp(cmd, "perplexity") == 0) {
         return cmd_perplexity(argc - 2, argv + 2);
     } else {

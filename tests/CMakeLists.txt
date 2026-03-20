@@ -460,6 +460,12 @@ target_link_libraries(test_lora PRIVATE Catch2::Catch2WithMain nos_training)
 target_include_directories(test_lora PRIVATE ${CMAKE_SOURCE_DIR}/src)
 catch_discover_tests(test_lora)
 
+# ── Sparkline Tests ──────────────────────────────────────────────────
+add_executable(test_sparkline test_sparkline.cpp)
+target_link_libraries(test_sparkline PRIVATE Catch2::Catch2WithMain nos_dashboard)
+target_include_directories(test_sparkline PRIVATE ${CMAKE_SOURCE_DIR}/src)
+catch_discover_tests(test_sparkline)
+
 # ── SharedMetrics Tests ──────────────────────────────────────────────
 add_executable(test_shared_metrics test_shared_metrics.cpp)
 target_link_libraries(test_shared_metrics PRIVATE Catch2::Catch2WithMain nos_server)
