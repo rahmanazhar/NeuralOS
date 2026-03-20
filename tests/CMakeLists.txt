@@ -453,3 +453,9 @@ add_executable(test_galore test_galore.cpp)
 target_link_libraries(test_galore PRIVATE Catch2::Catch2WithMain nos_training)
 target_include_directories(test_galore PRIVATE ${CMAKE_SOURCE_DIR}/src)
 catch_discover_tests(test_galore)
+
+# ── LoRA Tests ───────────────────────────────────────────────────────
+add_executable(test_lora test_lora.cpp)
+target_link_libraries(test_lora PRIVATE Catch2::Catch2WithMain nos_training)
+target_include_directories(test_lora PRIVATE ${CMAKE_SOURCE_DIR}/src)
+catch_discover_tests(test_lora)

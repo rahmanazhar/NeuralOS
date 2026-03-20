@@ -4,6 +4,8 @@ add_library(nos_training STATIC
     data_loader.cpp
     badam.cpp
     galore.cpp
+    lora.cpp
+    trainer.cpp
 )
 
 target_include_directories(nos_training PUBLIC ${CMAKE_SOURCE_DIR}/src)
