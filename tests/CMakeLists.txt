@@ -417,3 +417,9 @@ catch_discover_tests(test_prefetch_predictor)
 add_executable(test_oracle_prefetcher test_oracle_prefetcher.cpp)
 target_link_libraries(test_oracle_prefetcher PRIVATE Catch2::Catch2WithMain nos_engine)
 catch_discover_tests(test_oracle_prefetcher)
+
+# ── libneuralos C API Tests ────────────────────────────────────────────
+add_executable(test_libneuralos test_libneuralos.cpp)
+target_link_libraries(test_libneuralos PRIVATE Catch2::Catch2WithMain neuralos_shared)
+target_include_directories(test_libneuralos PRIVATE ${CMAKE_SOURCE_DIR}/src)
+catch_discover_tests(test_libneuralos)
