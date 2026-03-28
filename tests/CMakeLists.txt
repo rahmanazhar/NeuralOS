@@ -483,3 +483,9 @@ add_executable(test_bench_command test_bench_command.cpp)
 target_link_libraries(test_bench_command PRIVATE Catch2::Catch2WithMain nos_engine)
 target_include_directories(test_bench_command PRIVATE ${CMAKE_SOURCE_DIR}/src)
 catch_discover_tests(test_bench_command)
+
+# ── Trainer NXP Integration Tests ──────────────────────────────────
+add_executable(test_trainer_nxp test_trainer_nxp.cpp)
+target_link_libraries(test_trainer_nxp PRIVATE Catch2::Catch2WithMain nos_training nos_format nos_converter nos_kernel)
+target_include_directories(test_trainer_nxp PRIVATE ${CMAKE_SOURCE_DIR}/src)
+catch_discover_tests(test_trainer_nxp)
