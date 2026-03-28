@@ -1,5 +1,9 @@
 /// @file badam.cpp
 /// @brief BAdam block-wise Adam optimizer implementation.
+///
+/// Architecture note: BAdam and GaLore are independent optimizers composed
+/// by Trainer (see trainer.cpp). BAdam handles per-expert blocks; GaLore
+/// handles shared attention/router layers. No internal delegation.
 
 #include "training/badam.h"
 

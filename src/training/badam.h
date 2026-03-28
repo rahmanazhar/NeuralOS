@@ -40,6 +40,12 @@ struct BAdamConfig {
 
 /// BAdam block-wise Adam optimizer.
 ///
+/// NOTE: BAdamOptimizer handles expert block weights only. Shared layer
+/// updates (attention, router) are handled by GaLoreOptimizer, called
+/// independently by the Trainer. This decoupled design was chosen over
+/// internal delegation because BAdam and GaLore operate on different
+/// weight categories with different memory profiles.
+///
 /// Implements AdamW (decoupled weight decay) with per-block state lifecycle.
 /// Between blocks, reset_state() zeroes out moments and resets the step
 /// counter, freeing the optimizer memory for the next block.

@@ -13,6 +13,9 @@
 #include "tokenizer/tokenizer.h"
 #include "training/lora.h"
 #include "training/trainer.h"
+#include "format/expert_format.h"
+#include "kernel/packing.h"
+#include "converter/quantizer.h"
 #include "vmm/memory_budget.h"
 #include "vmm/vmm.h"
 
@@ -711,9 +714,9 @@ static int cmd_merge(int argc, char** argv) {
         }
     }
 
-    // For each adapter, load and report (actual weight merging requires
-    // loading the .nxp expert weights, which is done in production via VMM)
-    size_t merged_count = 0;
+    // Load all adapters
+    std::vector<nos::LoRAAdapter> adapters;
+    std::vector<std::string> loaded_names;
     for (const auto& name : adapter_names) {
         std::string adir = adapter_dir + "/" + name;
         nos::LoRAAdapter adapter;
@@ -722,20 +725,152 @@ static int cmd_merge(int argc, char** argv) {
                          name.c_str());
             continue;
         }
-
-        std::fprintf(stderr, "  Merged adapter: %s (rank=%zu, params=%zu)\n",
-                     name.c_str(), adapter.rank(), adapter.param_count());
-        ++merged_count;
+        std::fprintf(stderr, "  Loaded adapter: %s (rank=%zu, dims=%zux%zu)\n",
+                     name.c_str(), adapter.rank(),
+                     adapter.output_dim(), adapter.input_dim());
+        adapters.push_back(std::move(adapter));
+        loaded_names.push_back(name);
     }
 
-    // Copy .nxp file (in production, would modify weights in-place)
+    // Find base .nxp file
+    std::string nxp_path;
     for (const auto& entry : std::filesystem::directory_iterator(model_dir)) {
-        const auto& src = entry.path();
-        if (src.extension() == ".nxp") {
-            auto dst = std::filesystem::path(output_dir) / src.filename();
-            std::filesystem::copy_file(src, dst,
-                std::filesystem::copy_options::overwrite_existing);
+        if (entry.path().extension() == ".nxp") {
+            nxp_path = entry.path().string();
+            break;
         }
+    }
+
+    // Read model config for dimensions
+    std::string cfg_path = model_dir + "/model_config.json";
+    std::ifstream cfg_ifs(cfg_path);
+    nlohmann::json model_cfg;
+    uint32_t merge_hidden = 0, merge_intermediate = 0;
+    uint32_t merge_n_layers = 0, merge_experts_per_layer = 0;
+    if (cfg_ifs.is_open()) {
+        try {
+            model_cfg = nlohmann::json::parse(cfg_ifs);
+            merge_hidden = model_cfg.value("hidden_dim", 0u);
+            merge_intermediate = model_cfg.value("intermediate_dim", 0u);
+            merge_n_layers = model_cfg.value("n_layers", 0u);
+            merge_experts_per_layer = model_cfg.value("expert_count", 0u);
+        } catch (...) {}
+    }
+
+    size_t merged_count = 0;
+
+    // Merge adapters into .nxp expert weights and write output
+    if (!nxp_path.empty()) {
+        nos::NxpReader reader;
+        if (!reader.open(nxp_path)) {
+            std::fprintf(stderr, "ERROR: Failed to open base .nxp: %s\n", nxp_path.c_str());
+            return 1;
+        }
+
+        std::string out_nxp = output_dir + "/model.nxp";
+        nos::NxpWriter writer;
+        nos::NxpFileHeader out_hdr = reader.header();
+        if (!writer.open(out_nxp, out_hdr)) {
+            std::fprintf(stderr, "ERROR: Failed to create output .nxp: %s\n", out_nxp.c_str());
+            return 1;
+        }
+
+        // Process each expert entry
+        for (uint32_t layer = 0; layer < merge_n_layers; ++layer) {
+            uint32_t n_exp = (merge_experts_per_layer > 0) ? merge_experts_per_layer : 1;
+            for (uint32_t exp_id = 0; exp_id < n_exp; ++exp_id) {
+                const nos::NxpExpertEntry* entry = reader.find_expert(layer, exp_id);
+                if (entry == nullptr) continue;
+
+                // Read packed weights and scales
+                std::vector<uint8_t> packed_buf(static_cast<size_t>(entry->size));
+                int rd = reader.read_expert(*entry, packed_buf.data(), packed_buf.size());
+                std::vector<uint16_t> scale_buf(static_cast<size_t>(entry->num_channels));
+                int sd = reader.read_scales(*entry, scale_buf.data(),
+                                            static_cast<size_t>(entry->scale_size));
+
+                if (rd <= 0 || sd <= 0) {
+                    // Copy unchanged on read failure
+                    writer.write_expert(layer, exp_id,
+                                        packed_buf.data(), packed_buf.size(),
+                                        scale_buf.data(), entry->num_channels);
+                    continue;
+                }
+
+                // Check if any adapter targets this expert
+                bool has_match = false;
+                for (size_t a = 0; a < loaded_names.size(); ++a) {
+                    // Adapter names look like "layer0_q_proj" or similar
+                    // MoE expert adapters would contain the layer number
+                    std::string prefix = "layer" + std::to_string(layer);
+                    if (loaded_names[a].find(prefix) != 0) continue;
+
+                    // Dequantize expert weights to FP32
+                    int rows = static_cast<int>(merge_hidden);
+                    int cols = static_cast<int>(merge_intermediate);
+                    if (rows == 0 || cols == 0) {
+                        rows = static_cast<int>(entry->num_channels);
+                        cols = static_cast<int>(entry->size * 5 /
+                               static_cast<size_t>(rows));
+                    }
+                    int pkd_cols = (cols + 4) / 5;
+                    size_t total_params = static_cast<size_t>(rows) *
+                                          static_cast<size_t>(cols);
+                    std::vector<float> weights_fp32(total_params);
+                    std::vector<int8_t> trits(static_cast<size_t>(cols));
+
+                    for (int r = 0; r < rows; ++r) {
+                        const uint8_t* row_p = packed_buf.data()
+                            + static_cast<size_t>(r) * static_cast<size_t>(pkd_cols);
+                        nos::unpack_row(row_p, cols, trits.data());
+                        float scale = nos::fp16_to_fp32(
+                            scale_buf[static_cast<size_t>(r)]);
+                        for (int c = 0; c < cols; ++c) {
+                            weights_fp32[static_cast<size_t>(r) *
+                                         static_cast<size_t>(cols) +
+                                         static_cast<size_t>(c)] =
+                                static_cast<float>(trits[static_cast<size_t>(c)]) * scale;
+                        }
+                    }
+
+                    // Apply merge_into
+                    adapters[a].merge_into(weights_fp32.data(),
+                                           static_cast<size_t>(rows),
+                                           static_cast<size_t>(cols));
+
+                    // Re-quantize: FP32 -> FP16 -> ternary
+                    std::vector<uint16_t> fp16_buf(total_params);
+                    for (size_t i = 0; i < total_params; ++i) {
+                        fp16_buf[i] = nos::fp32_to_fp16(weights_fp32[i]);
+                    }
+                    nos::QuantizedWeights qw = nos::ternary_quantize(
+                        fp16_buf.data(), rows, cols);
+
+                    // Write re-quantized weights
+                    writer.write_expert(layer, exp_id,
+                                        qw.packed.data(), qw.packed.size(),
+                                        qw.scales.data(),
+                                        static_cast<uint32_t>(qw.scales.size()));
+                    has_match = true;
+                    ++merged_count;
+                    std::fprintf(stderr, "  Merged adapter %s into layer %u expert %u\n",
+                                 loaded_names[a].c_str(), layer, exp_id);
+                    break;
+                }
+
+                if (!has_match) {
+                    // No adapter for this expert -- copy unchanged
+                    writer.write_expert(layer, exp_id,
+                                        packed_buf.data(), packed_buf.size(),
+                                        scale_buf.data(), entry->num_channels);
+                }
+            }
+        }
+
+        writer.finalize();
+        std::fprintf(stderr, "Output .nxp written: %s\n", out_nxp.c_str());
+    } else {
+        std::fprintf(stderr, "WARNING: No .nxp file found in base model, skipping weight merge\n");
     }
 
     std::fprintf(stderr, "Merge complete: %zu adapters applied\n", merged_count);
