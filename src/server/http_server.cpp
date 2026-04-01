@@ -183,6 +183,9 @@ struct HttpServer::Impl {
 
     // Throttle metrics writes to every 100ms
     std::chrono::steady_clock::time_point last_metrics_write{};
+
+    // Sparkline ring buffer index
+    uint32_t sparkline_idx = 0;
 };
 
 HttpServer::HttpServer() : impl_(std::make_unique<Impl>()) {}
@@ -638,6 +641,30 @@ void HttpServer::update_shared_metrics() {
     m.last_update_epoch = epoch_seconds();
     m.active_slots = static_cast<uint32_t>(impl_->scheduler->active_count());
     m.max_slots = static_cast<uint32_t>(impl_->scheduler->slot_count());
+
+    // Aggregate performance metrics from all slots
+    auto agg = impl_->scheduler->aggregate_metrics();
+    m.tok_per_sec = agg.tok_per_sec;
+    m.ttft_ms = agg.ttft_ms;
+    m.latency_p50_ms = agg.latency_p50_ms;
+    m.latency_p95_ms = agg.latency_p95_ms;
+    m.latency_p99_ms = agg.latency_p99_ms;
+    m.cache_hit_rate = agg.cache_hit_rate;
+    m.evictions = agg.evictions;
+    m.resident_experts = agg.resident_experts;
+    m.oracle_rwp = agg.oracle_rwp;
+    m.waste_ratio = agg.waste_ratio;
+    std::strncpy(m.prefetch_mode, agg.prefetch_mode.c_str(),
+                 sizeof(m.prefetch_mode) - 1);
+    m.switch_rate = agg.switch_rate;
+    m.sticky_pct = agg.sticky_pct;
+    m.shift_detections = agg.shift_detections;
+
+    // Update sparkline history ring buffer
+    m.tok_per_sec_history[impl_->sparkline_idx % 120] =
+        static_cast<float>(agg.tok_per_sec);
+    impl_->sparkline_idx = (impl_->sparkline_idx + 1) % 120;
+    m.history_write_idx = impl_->sparkline_idx;
 
     impl_->metrics_writer->update(m);
 }

@@ -20,6 +20,24 @@ namespace nos {
 
 class RequestScheduler {
 public:
+    /// Aggregated metrics across all slots (for shared memory dashboard).
+    struct AggregatedSlotMetrics {
+        double tok_per_sec = 0.0;
+        double ttft_ms = 0.0;
+        double latency_p50_ms = 0.0;
+        double latency_p95_ms = 0.0;
+        double latency_p99_ms = 0.0;
+        double cache_hit_rate = 0.0;
+        uint64_t evictions = 0;
+        uint32_t resident_experts = 0;
+        double oracle_rwp = 0.0;
+        double waste_ratio = 0.0;
+        std::string prefetch_mode = "none";
+        double switch_rate = 0.0;
+        double sticky_pct = 0.0;
+        uint32_t shift_detections = 0;
+    };
+
     struct Slot {
         int slot_id = -1;
         nos_ctx_t* ctx = nullptr;
@@ -87,6 +105,9 @@ public:
 
     /// @return true if at least one slot was successfully created.
     bool is_ready() const;
+
+    /// Aggregate metrics from all slots. Thread-safe (locks scheduler mutex).
+    AggregatedSlotMetrics aggregate_metrics() const;
 
 private:
     mutable std::mutex scheduler_mutex_;

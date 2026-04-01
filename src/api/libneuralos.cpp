@@ -447,6 +447,43 @@ const char* nos_get_metrics(nos_ctx_t* ctx) {
     }
     try {
         nlohmann::json j = ctx->engine.metrics().to_json();
+
+        // Add TTFT
+        j["ttft_ms"] = ctx->engine.ttft_ms();
+
+        // Add routing metrics
+        auto rm = ctx->engine.routing_metrics();
+        j["routing"] = {
+            {"total_decisions", rm.total_routing_decisions},
+            {"total_switches", rm.total_switches},
+            {"switch_rate", static_cast<double>(rm.switch_rate)},
+            {"avg_window_length", static_cast<double>(rm.avg_window_length)}
+        };
+
+        // Add prefetch stats
+        auto ps = ctx->engine.prefetch_stats();
+        j["prefetch"] = {
+            {"mode", ps.mode},
+            {"rwp_oracle", ps.rwp_oracle},
+            {"rwp_best_baseline", ps.rwp_best_baseline},
+            {"effective_k", ps.effective_k},
+            {"speculative_hits", ps.speculative_hits},
+            {"speculative_misses", ps.speculative_misses}
+        };
+
+        // Add VMM stats
+        if (ctx->vmm) {
+            auto vs = ctx->vmm->stats();
+            j["vmm"] = {
+                {"total_pins", vs.total_pins},
+                {"cache_hits", vs.cache_hits},
+                {"cache_misses", vs.cache_misses},
+                {"evictions", vs.evictions},
+                {"resident_pages", vs.resident_pages},
+                {"hit_rate", vs.hit_rate}
+            };
+        }
+
         ctx->metrics_json_cache = j.dump();
         return ctx->metrics_json_cache.c_str();
     } catch (...) {
