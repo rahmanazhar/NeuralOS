@@ -149,6 +149,20 @@ TEST_CASE("train_full loads and saves expert weights via NXP", "[trainer_nxp]") 
     nos::Trainer trainer;
     REQUIRE(trainer.train(cfg));
 
+    // Verify model_config.json was copied to output directory (TRNG-01 gap closure)
+    REQUIRE(fs::exists(output_dir / "model_config.json"));
+
+    // Verify model_config.json content matches source
+    {
+        std::ifstream src_cfg((model_dir / "model_config.json").string());
+        std::ifstream out_cfg((output_dir / "model_config.json").string());
+        REQUIRE(src_cfg.is_open());
+        REQUIRE(out_cfg.is_open());
+        nlohmann::json src_j = nlohmann::json::parse(src_cfg);
+        nlohmann::json out_j = nlohmann::json::parse(out_cfg);
+        REQUIRE(src_j == out_j);
+    }
+
     // Verify output .nxp exists
     std::string out_nxp = (output_dir / "model.nxp").string();
     REQUIRE(fs::exists(out_nxp));
@@ -239,6 +253,9 @@ TEST_CASE("train_full falls back to synthetic mode without .nxp", "[trainer_nxp]
     nos::Trainer trainer;
     // Should succeed in synthetic/demo mode
     REQUIRE(trainer.train(cfg));
+
+    // Verify model_config.json was copied even in synthetic mode
+    REQUIRE(fs::exists(output_dir / "model_config.json"));
 
     // No output .nxp should be written in synthetic mode
     bool has_nxp = false;

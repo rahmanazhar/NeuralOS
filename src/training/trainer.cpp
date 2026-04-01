@@ -104,6 +104,18 @@ bool Trainer::train_full(const TrainConfig& config) {
     // Create output directory
     std::filesystem::create_directories(config.output_dir);
 
+    // Copy model_config.json, tokenizer, and other metadata files from source
+    // model directory to output directory. This ensures the output is a valid
+    // drop-in model directory for InferenceEngine::load().
+    for (const auto& entry : std::filesystem::directory_iterator(config.model_dir)) {
+        const auto& src = entry.path();
+        if (src.extension() == ".json" || src.extension() == ".model") {
+            auto dst = std::filesystem::path(config.output_dir) / src.filename();
+            std::filesystem::copy_file(src, dst,
+                std::filesystem::copy_options::overwrite_existing);
+        }
+    }
+
     // Try to open .nxp file for real expert I/O
     std::string nxp_path;
     for (const auto& entry : std::filesystem::directory_iterator(config.model_dir)) {
@@ -335,6 +347,16 @@ bool Trainer::train_lora(const TrainConfig& config) {
 
     // Create output directory
     std::filesystem::create_directories(config.output_dir);
+
+    // Copy model_config.json and tokenizer files to output directory
+    for (const auto& entry : std::filesystem::directory_iterator(config.model_dir)) {
+        const auto& src = entry.path();
+        if (src.extension() == ".json" || src.extension() == ".model") {
+            auto dst = std::filesystem::path(config.output_dir) / src.filename();
+            std::filesystem::copy_file(src, dst,
+                std::filesystem::copy_options::overwrite_existing);
+        }
+    }
 
     // Create LoRA adapters for each attention projection.
     // Base weights are frozen during LoRA training. The adapters are saved
