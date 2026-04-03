@@ -24,3 +24,5 @@ compile_commands.json
 
 # Dependency fetches (managed by FetchContent)
 _deps/
+CMakeFiles/CMakeOutput.log
+CMakeFiles/CMakeSystem.cmake
