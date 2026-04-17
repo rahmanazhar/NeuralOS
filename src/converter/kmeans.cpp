@@ -102,8 +102,13 @@ KMeansResult balanced_kmeans(const float* data, int n_points, int dim, int k,
     // Initialize centroids via k-means++
     auto centroids = kmeans_pp_init(data, n_points, dim, k, rng);
 
-    // Balance constraint: max cluster size
-    int max_size = static_cast<int>(std::ceil(static_cast<float>(n_points) / static_cast<float>(k) * 1.2f));
+    // Balance constraint: STRICTLY equal cluster sizes when divisible.
+    // The inference engine requires all experts have exactly intermediate_dim/expert_count rows,
+    // so we enforce floor(n_points/k) max size. Remainder points (if any) get distributed
+    // one per cluster starting from cluster 0.
+    int base_size = n_points / k;
+    int remainder = n_points % k;
+    int max_size = base_size + (remainder > 0 ? 1 : 0);
 
     std::vector<int> assignments(static_cast<size_t>(n_points), -1);
 

@@ -452,6 +452,29 @@ bool ConversionPipeline::run(const ConversionConfig& config) {
     // --- Stage 4: Write non-expert tensors ---
     std::fprintf(stderr, "INFO: Stage 4/5: Writing embeddings and output projection...\n");
 
+    // Helper: read a tensor as FP16 bytes, converting from FP32 if needed
+    auto read_tensor_as_fp16 = [&](const TensorInfo* info,
+                                   std::vector<uint8_t>& out_buf) -> bool {
+        if (info->dtype == "F32") {
+            size_t data_size = static_cast<size_t>(info->end - info->begin);
+            size_t num_elems = data_size / sizeof(float);
+            std::vector<float> f32(num_elems);
+            if (!impl_->reader->read_tensor(*info, f32.data(), data_size))
+                return false;
+            std::vector<uint16_t> fp16(num_elems);
+            for (size_t i = 0; i < num_elems; i++)
+                fp16[i] = fp32_to_fp16(f32[i]);
+            out_buf.resize(num_elems * sizeof(uint16_t));
+            std::memcpy(out_buf.data(), fp16.data(), out_buf.size());
+        } else {
+            size_t data_size = static_cast<size_t>(info->end - info->begin);
+            out_buf.resize(data_size);
+            if (!impl_->reader->read_tensor(*info, out_buf.data(), data_size))
+                return false;
+        }
+        return true;
+    };
+
     // Embedding matrix
     std::vector<std::string> emb_names = {
         "model.embed_tokens.weight", "token_embd.weight", "tok_embeddings.weight"
@@ -460,9 +483,8 @@ bool ConversionPipeline::run(const ConversionConfig& config) {
         const TensorInfo* info = impl_->reader->find_tensor(name);
         if (!info) continue;
 
-        size_t data_size = static_cast<size_t>(info->end - info->begin);
-        std::vector<uint8_t> buf(data_size);
-        if (impl_->reader->read_tensor(*info, buf.data(), buf.size())) {
+        std::vector<uint8_t> buf;
+        if (read_tensor_as_fp16(info, buf)) {
             writer.write_expert(
                 UINT32_MAX,  // reserved layer_id for non-layer tensors
                 0,           // embedding tensor
@@ -472,24 +494,44 @@ bool ConversionPipeline::run(const ConversionConfig& config) {
         break;
     }
 
-    // Output projection
+    // Output projection (fall back to embedding for tied-weight models)
     std::vector<std::string> lm_head_names = {
         "lm_head.weight", "output.weight"
     };
+    bool wrote_output_proj = false;
     for (const auto& name : lm_head_names) {
         const TensorInfo* info = impl_->reader->find_tensor(name);
         if (!info) continue;
 
-        size_t data_size = static_cast<size_t>(info->end - info->begin);
-        std::vector<uint8_t> buf(data_size);
-        if (impl_->reader->read_tensor(*info, buf.data(), buf.size())) {
+        std::vector<uint8_t> buf;
+        if (read_tensor_as_fp16(info, buf)) {
             writer.write_expert(
                 UINT32_MAX,
                 1,  // output projection
                 buf.data(), buf.size(),
                 nullptr, 0);
+            wrote_output_proj = true;
         }
         break;
+    }
+
+    // Tied embeddings: if no lm_head found, reuse embed_tokens as output projection
+    if (!wrote_output_proj) {
+        std::fprintf(stderr, "INFO: No lm_head found, using tied embeddings for output projection\n");
+        for (const auto& name : emb_names) {
+            const TensorInfo* info = impl_->reader->find_tensor(name);
+            if (!info) continue;
+
+            std::vector<uint8_t> buf;
+            if (read_tensor_as_fp16(info, buf)) {
+                writer.write_expert(
+                    UINT32_MAX,
+                    1,  // output projection (tied to embedding)
+                    buf.data(), buf.size(),
+                    nullptr, 0);
+            }
+            break;
+        }
     }
 
     // --- Stage 4b: Write RMSNorm weights ---

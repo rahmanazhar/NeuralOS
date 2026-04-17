@@ -266,26 +266,41 @@ bool InferenceEngine::load(const std::string& model_dir, Vmm* vmm, int num_threa
     }
 
     // --- Load embedding matrix ---
+    size_t expected_emb_elems = sz(mc.vocab_size) * sz(mc.hidden_dim);
     const NxpExpertEntry* emb_entry = reader.find_expert(UINT32_MAX, 0);
     if (emb_entry) {
-        impl_->embedding.resize(emb_entry->size / sizeof(uint16_t));
+        size_t actual_elems = emb_entry->size / sizeof(uint16_t);
+        if (actual_elems != expected_emb_elems) {
+            std::fprintf(stderr, "ERROR: Embedding size mismatch: got %zu, expected %zu "
+                        "(vocab=%u, hidden=%u)\n",
+                        actual_elems, expected_emb_elems, mc.vocab_size, mc.hidden_dim);
+            return false;
+        }
+        impl_->embedding.resize(actual_elems);
         reader.read_expert(*emb_entry,
                           reinterpret_cast<uint8_t*>(impl_->embedding.data()),
                           emb_entry->size);
     } else {
         // Fallback: zero embeddings for testing
-        impl_->embedding.resize(sz(mc.vocab_size) * sz(mc.hidden_dim), 0);
+        impl_->embedding.resize(expected_emb_elems, 0);
     }
 
     // --- Load output projection ---
     const NxpExpertEntry* out_entry = reader.find_expert(UINT32_MAX, 1);
     if (out_entry) {
-        impl_->output_proj.resize(out_entry->size / sizeof(uint16_t));
+        size_t actual_elems = out_entry->size / sizeof(uint16_t);
+        if (actual_elems != expected_emb_elems) {
+            std::fprintf(stderr, "ERROR: Output projection size mismatch: got %zu, expected %zu "
+                        "(vocab=%u, hidden=%u)\n",
+                        actual_elems, expected_emb_elems, mc.vocab_size, mc.hidden_dim);
+            return false;
+        }
+        impl_->output_proj.resize(actual_elems);
         reader.read_expert(*out_entry,
                           reinterpret_cast<uint8_t*>(impl_->output_proj.data()),
                           out_entry->size);
     } else {
-        impl_->output_proj.resize(sz(mc.vocab_size) * sz(mc.hidden_dim), 0);
+        impl_->output_proj.resize(expected_emb_elems, 0);
     }
 
     // --- Load RMSNorm weights ---

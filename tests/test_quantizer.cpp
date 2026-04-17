@@ -63,9 +63,10 @@ TEST_CASE("Ternary quantization: basic correctness", "[quantizer]") {
         (void)packed_cols;
     }
 
-    SECTION("row 0 scale is absmax") {
+    SECTION("row 0 scale is mean(|w|) of non-zero trits") {
+        // Non-zero trit weights: |2.0|, |-1.5|, |1.8|, |-2.0| -> mean = 1.825
         float scale = nos::fp16_to_fp32(result.scales[0]);
-        CHECK_THAT(static_cast<double>(scale), WithinAbs(2.0, 0.01));
+        CHECK_THAT(static_cast<double>(scale), WithinAbs(1.825, 0.01));
     }
 
     SECTION("row 1 (all zeros) produces zero trits") {

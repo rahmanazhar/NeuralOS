@@ -24,17 +24,14 @@ QuantizedWeights ternary_quantize(const uint16_t* fp16_weights, int rows, int co
     for (int r = 0; r < rows; r++) {
         const uint16_t* row = fp16_weights + r * cols;
 
-        // Compute absmax for this channel
+        // Compute absmax for this channel (used for thresholding)
         float absmax = 0.0f;
         for (int c = 0; c < cols; c++) {
             float val = std::abs(fp16_to_fp32(row[c]));
             if (val > absmax) absmax = val;
         }
 
-        // Store scale as FP16
-        result.scales[static_cast<size_t>(r)] = fp32_to_fp16(absmax);
-
-        // Quantize: threshold at 0.5 * scale
+        // Quantize: threshold at 0.5 * absmax
         float threshold = 0.5f * absmax;
 
         for (int c = 0; c < cols; c++) {
@@ -45,6 +42,18 @@ QuantizedWeights ternary_quantize(const uint16_t* fp16_weights, int rows, int co
                 trits[static_cast<size_t>(c)] = 0;
             }
         }
+
+        // Compute scale as mean(|w|) of non-zero-quantized weights (BitNet b1.58)
+        float sum_abs = 0.0f;
+        int count = 0;
+        for (int c = 0; c < cols; c++) {
+            if (trits[static_cast<size_t>(c)] != 0) {
+                sum_abs += std::abs(fp16_to_fp32(row[c]));
+                count++;
+            }
+        }
+        float alpha = (count > 0) ? (sum_abs / static_cast<float>(count)) : 0.0f;
+        result.scales[static_cast<size_t>(r)] = fp32_to_fp16(alpha);
 
         // Pack trits using existing pack_row
         uint8_t* packed_row = result.packed.data()

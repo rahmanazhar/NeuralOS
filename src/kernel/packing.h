@@ -52,7 +52,7 @@ inline float fp16_to_fp32(uint16_t h) {
 }
 
 /// Convert a single-precision float to half-precision float (stored as uint16_t).
-/// Simple truncation (no rounding).
+/// Uses round-to-nearest (ties round up) for minimal conversion error.
 inline uint16_t fp32_to_fp16(float f) {
     uint32_t bits;
     __builtin_memcpy(&bits, &f, sizeof(bits));
@@ -68,6 +68,17 @@ inline uint16_t fp32_to_fp16(float f) {
     if (exponent < -14) {
         // Underflow -> zero (subnormals not worth handling for scale factors)
         return sign;
+    }
+
+    // Round-to-nearest: add bit 12 (0.5 ULP of FP16 mantissa)
+    mantissa += 0x00001000u;
+    if (mantissa & 0x00800000u) {
+        // Carry overflowed into hidden bit — increment exponent, reset mantissa
+        mantissa = 0;
+        exponent++;
+        if (exponent > 15) {
+            return sign | 0x7C00u;  // overflow to Inf
+        }
     }
 
     return sign | static_cast<uint16_t>((exponent + 15) << 10)
